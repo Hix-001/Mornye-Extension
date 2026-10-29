@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def package(source):
-    manifest = json.loads((source / "manifest.json").read_text())
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     filenames = ["manifest.json", "index.js"]
     licenses = ["LICENSE", "COPYING", "NOTICE"]
     icon = manifest.get("icon")
@@ -30,8 +30,11 @@ def package(source):
             entry = ZipInfo(filename, date_time=(2020, 1, 1, 0, 0, 0))
             entry.create_system = 3
             entry.external_attr = 0o100644 << 16
+            content = ((ROOT if filename in licenses else source) / filename).read_bytes()
+            if filename.endswith((".json", ".js", "LICENSE", "COPYING", "NOTICE")):
+                content = content.replace(b"\r\n", b"\n")
             archive.writestr(
-                entry, ((ROOT if filename in licenses else source) / filename).read_bytes(),
+                entry, content,
                 compress_type=ZIP_DEFLATED, compresslevel=9,
             )
     return buffer.getvalue()
@@ -44,7 +47,7 @@ def main():
     args = parser.parse_args()
     providers = args.providers or sorted(path.name for path in (ROOT / "sources").iterdir() if path.is_dir())
     registry_path = ROOT / "registry.json"
-    registry = json.loads(registry_path.read_text())
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
     changed = False
     stale = []
@@ -54,7 +57,7 @@ def main():
         if Path(provider).name != provider or provider in (".", ".."):
             parser.error(f"Invalid provider directory: {provider}")
         source = ROOT / "sources" / provider
-        manifest = json.loads((source / "manifest.json").read_text())
+        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
         matches = [entry for entry in registry["extensions"] if entry["id"] == manifest["name"]]
         if len(matches) != 1:
             parser.error(f"Expected one registry entry for {manifest['name']}")
@@ -81,7 +84,7 @@ def main():
         parser.exit(1, "Stale packages or registry entries: " + ", ".join(stale) + "\n")
     if changed:
         registry["updated_at"] = timestamp
-        registry_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n")
+        registry_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
