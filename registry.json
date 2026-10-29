@@ -9,7 +9,7 @@
       "version": "1.10.4",
       "description": "Spotify metadata provider for Mornye with complete native release, disc, catalog ID, credits, and artwork metadata plus guarded genre enrichment.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/spotify-web.sflx",
-      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/Spotify_Primary_Logo_RGB_Green.png",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/spotify-web.png",
       "sha256": "5ccae8a8c236c97500328a22d69ac039c779179a0c9386e8e3b89e152389dbad",
       "category": "integration",
       "tags": [
@@ -30,7 +30,7 @@
       "description": "Amazon Music metadata & download provider for Mornye. Includes complete Amazon Web release metadata, original-resolution artwork, lossless audio, and Dolby Atmos.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/amzn.sflx",
       "sha256": "d45e105b4286d4c7ddc062b73b8190c93099e7f6e4d4586b420e0b31dabcb967",
-      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/amazon_music.png",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/amazon.png",
       "category": "download",
       "tags": [
         "amazon",
@@ -51,7 +51,7 @@
       "description": "Apple Music metadata and lyrics provider for Mornye with guarded track matching, bounded caching, resilient requests, and complete release metadata.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/apple-music.sflx",
       "sha256": "6a45c61e608bd59ad6a000ceedc6ee4ef533599408fd30ea8e673669af86ef17",
-      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/apple_music.png",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/apple-music.png",
       "category": "integration",
       "tags": [
         "apple",
@@ -80,7 +80,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-26T00:00:00Z",
-      "min_app_version": "4.9.1"
+      "min_app_version": "4.9.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/soundcloud.png"
     },
     {
       "id": "ytmusic-spotiflac",
@@ -90,7 +91,7 @@
       "description": "YouTube Music metadata and download provider with native album, artist, explicit, release, and song-credit metadata plus validated catalog enrichment.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/ytmusic-spotiflac.sflx",
       "sha256": "bf88cf556df132402c4235a2660e941e7135c6d052a4aa204f8a51cd812f8c1e",
-      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/ytmusic-spotiflac.jpg",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/ytmusic-spotiflac.png",
       "category": "download",
       "tags": [
         "youtube",
@@ -122,7 +123,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-22T00:00:00Z",
-      "min_app_version": "4.9.1"
+      "min_app_version": "4.9.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/deezer.png"
     },
     {
       "id": "qobuz-web",
@@ -142,7 +144,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-22T00:00:00Z",
-      "min_app_version": "4.9.1"
+      "min_app_version": "4.9.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/qobuz-web.png"
     },
     {
       "id": "tidal-web",
@@ -162,7 +165,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-22T00:00:00Z",
-      "min_app_version": "4.9.0"
+      "min_app_version": "4.9.0",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/tidal-web.png"
     },
     {
       "id": "bugs-music",
@@ -182,7 +186,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-23T00:00:00Z",
-      "min_app_version": "3.0.1"
+      "min_app_version": "3.0.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/bugs-music.png"
     },
     {
       "id": "melon-music",
@@ -203,7 +208,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-23T00:00:00Z",
-      "min_app_version": "3.0.1"
+      "min_app_version": "3.0.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/melon-music.png"
     },
     {
       "id": "genie-music",
@@ -223,7 +229,8 @@
       ],
       "downloads": 0,
       "updated_at": "2026-10-23T00:00:00Z",
-      "min_app_version": "3.0.1"
+      "min_app_version": "3.0.1",
+      "icon_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/genie-music.png"
     },
     {
       "id": "jiosaavn",
