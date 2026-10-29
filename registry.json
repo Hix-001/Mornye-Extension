@@ -9,6 +9,7 @@
       "version": "1.10.4",
       "description": "Spotify metadata provider for Mornye with complete native release, disc, catalog ID, credits, and artwork metadata plus guarded genre enrichment.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/spotify-web.sflx",
+      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/Spotify_Primary_Logo_RGB_Green.png",
       "sha256": "5ccae8a8c236c97500328a22d69ac039c779179a0c9386e8e3b89e152389dbad",
       "category": "integration",
       "tags": [
@@ -29,6 +30,7 @@
       "description": "Amazon Music metadata & download provider for Mornye. Includes complete Amazon Web release metadata, original-resolution artwork, lossless audio, and Dolby Atmos.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/amzn.sflx",
       "sha256": "d45e105b4286d4c7ddc062b73b8190c93099e7f6e4d4586b420e0b31dabcb967",
+      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/amazon_music.png",
       "category": "download",
       "tags": [
         "amazon",
