@@ -49,6 +49,7 @@
       "description": "Apple Music metadata and lyrics provider for Mornye with guarded track matching, bounded caching, resilient requests, and complete release metadata.",
       "download_url": "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/extensions/apple-music.sflx",
       "sha256": "6a45c61e608bd59ad6a000ceedc6ee4ef533599408fd30ea8e673669af86ef17",
+      "icon_url" : "https://github.com/Hix-001/Mornye-Extension/blob/main/icons/apple_music.png",
       "category": "integration",
       "tags": [
         "apple",
