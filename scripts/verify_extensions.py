@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Comprehensive verification of all Mornye extensions, packages, digests, and icons."""
+"""Comprehensive verification of all Mornye extensions, packages, manifests, and icons."""
 
 import hashlib
 import json
 import sys
 import zipfile
 from pathlib import Path
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "registry.json"
@@ -20,7 +21,6 @@ def main():
     print(f"Total extensions in registry: {len(extensions)}")
 
     all_passed = True
-    results = []
 
     for ext in extensions:
         ext_id = ext["id"]
@@ -66,32 +66,30 @@ def main():
         icon_name = Path(icon_url).name if icon_url else None
         icon_file = ICONS_DIR / icon_name if icon_name else None
         icon_exists = icon_file.is_file() if icon_file else False
-        icon_url_valid = bool(icon_url and icon_url.startswith("https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/"))
+        icon_dim_ok = False
+        if icon_exists:
+            try:
+                with Image.open(icon_file) as im:
+                    icon_dim_ok = (im.size == (512, 512))
+            except Exception:
+                icon_dim_ok = False
 
-        ok = pkg_exists and sha_match and src_exists and manifest_matches and zip_ok and icon_exists and icon_url_valid
+        icon_url_valid = bool(
+            icon_url and (
+                icon_url.startswith("https://raw.githubusercontent.com/Hix-001/Mornye-Extension/main/icons/") or
+                icon_url.startswith("https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/icons/")
+            )
+        )
+
+        ok = (pkg_exists and sha_match and src_exists and manifest_matches and zip_ok and icon_exists and icon_dim_ok and icon_url_valid)
         if not ok:
             all_passed = False
 
-        results.append({
-            "id": ext_id,
-            "display_name": display_name,
-            "version": version,
-            "ok": ok,
-            "pkg_exists": pkg_exists,
-            "sha_match": sha_match,
-            "src_exists": src_exists,
-            "manifest_matches": manifest_matches,
-            "zip_ok": zip_ok,
-            "icon_name": icon_name,
-            "icon_exists": icon_exists,
-            "icon_url_valid": icon_url_valid,
-        })
-
         status = "[PASS]" if ok else "[FAIL]"
-        print(f"{status} {display_name:<16} (v{version}) | pkg: {pkg_exists} | sha: {sha_match} | src: {manifest_matches} | icon: {icon_name} ({icon_exists})")
+        print(f"{status} {display_name:<16} (v{version:<7}) | pkg: {pkg_exists} | sha: {sha_match} | src: {manifest_matches} | icon: {icon_name} (512x512: {icon_dim_ok})")
 
     if all_passed:
-        print("\nAll 12 extensions are verified and fully functional!")
+        print(f"\nAll {len(extensions)} extensions are verified and 100% functional!")
         sys.exit(0)
     else:
         print("\nSome extensions failed verification!")

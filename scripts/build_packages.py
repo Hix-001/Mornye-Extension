@@ -8,7 +8,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
+
+from build_unified_registry import synchronize
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +37,8 @@ def package(source):
                 content = content.replace(b"\r\n", b"\n")
             archive.writestr(
                 entry, content,
-                compress_type=ZIP_DEFLATED, compresslevel=9,
+                compress_type=ZIP_STORED if source.name == "amazon" else ZIP_DEFLATED,
+                compresslevel=9,
             )
     return buffer.getvalue()
 
@@ -85,6 +88,10 @@ def main():
     if changed:
         registry["updated_at"] = timestamp
         registry_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        synchronize(check=args.check)
+    except ValueError as error:
+        parser.exit(1, str(error) + "\n")
 
 
 if __name__ == "__main__":

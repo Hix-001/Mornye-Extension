@@ -1,6 +1,6 @@
 // ============================================
 // Apple Music Extension for Mornye
-// Version: 1.4.14
+// Version: 1.4.16
 //
 // Uses Apple Music's public catalog API (amp-api)
 // to fetch metadata including ISRC. No login required.
@@ -24,6 +24,9 @@ const RETRY_BASE_DELAY_MS = 250;
 const RETRY_MAX_DELAY_MS = 4000;
 const RETRY_MAX_SERVER_DELAY_MS = 30000;
 const MIN_TRACK_MATCH_SCORE = 70;
+const RELATED_MAX_SEEDS = 5;
+const RELATED_ALBUM_LIMIT = 12;
+const RELATED_TRACKS_PER_ALBUM = 4;
 const CACHE_MISS = { cacheMiss: true };
 const MEMORY_CACHE = new Map();
 
@@ -662,8 +665,9 @@ function parseAppleMusicURL(url) {
   // https://music.apple.com/{storefront}/playlist/{name}/{id}
   // https://music.apple.com/{storefront}/artist/{name}/{id}
   // https://music.apple.com/{storefront}/song/{name}/{id}
+  // Shared links may omit {name}; user playlist IDs contain a hyphen (pl.u-...).
   var match = url.match(
-    /music\.apple\.com\/([a-z]{2})\/(album|playlist|artist|song)\/[^/]*\/([a-z0-9.]+)/i
+    /^(?:https?:\/\/)?music\.apple\.com\/([a-z]{2})\/(album|playlist|artist|song)\/(?:[^/?#]+\/)?([a-z0-9.-]+)\/?(?:[?#]|$)/i
   );
   if (!match) return null;
 
@@ -672,7 +676,7 @@ function parseAppleMusicURL(url) {
   var id = match[3];
 
   // Check for ?i=songId on album URLs
-  var songMatch = url.match(/[?&]i=(\d+)/);
+  var songMatch = url.split("#")[0].match(/[?&]i=(\d+)(?:&|$)/);
 
   if (type === "album" && songMatch) {
     return { type: "track", id: songMatch[1], storefront: storefront };
@@ -1364,8 +1368,25 @@ function getConcert(id) {
   return detail ? cacheSet(key, detail, METADATA_CACHE_TTL_MS) : null;
 }
 
+// Apple returns an artist's albums in no useful order. Newest first, releases without a date
+// last, ties in the order Apple sent them. Only the albums of one page can be ordered here; a
+// catalog that spans several pages is ordered page by page.
+function sortAlbumsNewestFirst(items) {
+  return items.map(function (album, index) {
+    var date = String(album && album.attributes && album.attributes.releaseDate || "");
+    return { album: album, index: index, date: date };
+  }).sort(function (a, b) {
+    if (a.date !== b.date) {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return a.date < b.date ? 1 : -1;
+    }
+    return a.index - b.index;
+  }).map(function (entry) { return entry.album; });
+}
+
 function formatArtistAlbums(items, artistID, artistAttributes) {
-  return items.map(function (album) {
+  return sortAlbumsNewestFirst(items).map(function (album) {
     var attr = album.attributes || {};
     return {
       id: album.id || "",
@@ -1675,6 +1696,193 @@ function normalizeText(text) {
     .replace(/[^a-z0-9\u00c0-\u024f\u0400-\u04ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// ============================================
+// RELATED TRACKS
+// ============================================
+
+/**
+ * Resolve a seed to an Apple Music song ID and its album ID. Own seeds use
+ * their ID directly; foreign seeds go through the guarded song matcher, which
+ * also requires an exact ISRC when both sides carry one.
+ */
+function resolveRelatedSeed(seed) {
+  seed = seed || {};
+  var id = String(seed.id || "").trim();
+  var seedISRC = String(seed.isrc || "").trim().toUpperCase();
+
+  if (normalizeProviderID(seed.provider_id) === "apple-music" && /^\d+$/.test(id)) {
+    var knownAlbumID = String(seed.album_id || "").trim();
+    var cachedTrack = cacheGet(scopedCacheKey("track", id));
+    if (!/^\d+$/.test(knownAlbumID) && cachedTrack && cachedTrack.track) {
+      knownAlbumID = String(cachedTrack.track.album_id || "");
+    }
+    if (/^\d+$/.test(knownAlbumID)) {
+      return { id: id, albumID: knownAlbumID, isrc: seedISRC };
+    }
+    var songData = apiGet("songs/" + encodeURIComponent(id));
+    var song = (songData.data || [])[0];
+    if (!song) return null;
+    var songISRC = String(song.attributes && song.attributes.isrc || "").trim().toUpperCase();
+    return { id: id, albumID: albumIDFromSong(song), isrc: songISRC || seedISRC };
+  }
+
+  var searchTerm = ((seed.name || "") + " " + (seed.artists || "")).trim();
+  if (!searchTerm) return null;
+  var match = findBestMatch(
+    searchAppleSongs(searchTerm, 8),
+    seed.name,
+    seed.artists,
+    seed.album_name || "",
+    Number(seed.duration_ms || 0),
+    seedISRC
+  );
+  if (!match || !match.id) return null;
+  var matchISRC = String(match.attributes && match.attributes.isrc || "").trim().toUpperCase();
+  return { id: String(match.id), albumID: albumIDFromSong(match), isrc: matchISRC || seedISRC };
+}
+
+/**
+ * Apple's catalog "You Might Also Like" view for an album, with each related
+ * album's tracks and artists included so one request yields playable songs.
+ */
+function fetchRelatedAlbums(albumID) {
+  var key = scopedCacheKey("related-albums", albumID);
+  var cached = cacheGet(key);
+  if (cached) return cached;
+  var data = apiGet(
+    "albums/" + encodeURIComponent(albumID) + "/view/you-might-also-like" +
+    "?include%5Balbums%5D=tracks,artists" +
+    "&limit=" + RELATED_ALBUM_LIMIT
+  );
+  return cacheSet(key, data.data || [], METADATA_CACHE_TTL_MS);
+}
+
+function relatedAlbumTitle(name) {
+  return normalizeText(String(name || "").replace(/\s+-\s+(single|ep)$/i, ""));
+}
+
+function relatedAlbumSongs(album) {
+  var relationship = album && album.relationships && album.relationships.tracks;
+  var items = relationship && relationship.data || [];
+  var songs = [];
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    if (item && item.id && item.attributes && (!item.type || item.type === "songs")) {
+      songs.push(item);
+    }
+  }
+  return songs;
+}
+
+/**
+ * Flatten related albums into one track list: the title track (or the first
+ * track) of every album first, then later tracks, so a single long album does
+ * not crowd out the others.
+ */
+function relatedTracksFromAlbums(albums) {
+  var perAlbum = [];
+  albums = albums || [];
+  for (var i = 0; i < albums.length; i++) {
+    var album = albums[i];
+    if (!album || album.type && album.type !== "albums") continue;
+    var songs = relatedAlbumSongs(album);
+    if (!songs.length) continue;
+    album._totalDiscs = totalDiscsFromSongs(songs);
+    var title = relatedAlbumTitle(album.attributes && album.attributes.name);
+    for (var j = 0; title && j < songs.length; j++) {
+      if (normalizeText(songs[j].attributes.name || "") === title) {
+        songs.unshift(songs.splice(j, 1)[0]);
+        break;
+      }
+    }
+    perAlbum.push({ album: album, songs: songs.slice(0, RELATED_TRACKS_PER_ALBUM) });
+  }
+
+  var tracks = [];
+  for (var pass = 0; pass < RELATED_TRACKS_PER_ALBUM; pass++) {
+    for (var m = 0; m < perAlbum.length; m++) {
+      var song = perAlbum[m].songs[pass];
+      if (!song) continue;
+      var formatted = formatSong(song, perAlbum[m].album, perAlbum[m].album._totalDiscs);
+      formatted.source = "apple-music";
+      tracks.push(formatted);
+    }
+  }
+  return tracks;
+}
+
+function getRelatedTracks(seeds, options) {
+  var limit = Number(options && options.limit) || 25;
+  limit = Math.max(1, Math.min(50, Math.floor(limit)));
+  var list = Array.isArray(seeds) ? seeds.slice(0, 10) : [];
+
+  var excludedIDs = {};
+  var excludedISRCs = {};
+  for (var i = 0; i < list.length; i++) {
+    var seed = list[i] || {};
+    var seedISRC = String(seed.isrc || "").trim().toUpperCase();
+    if (seedISRC) excludedISRCs[seedISRC] = true;
+    if (normalizeProviderID(seed.provider_id) === "apple-music" && seed.id) {
+      excludedIDs[String(seed.id).trim()] = true;
+    }
+  }
+
+  var lists = [];
+  var succeeded = 0;
+  var failed = 0;
+  var lastError = "";
+  for (var s = 0; s < list.length && s < RELATED_MAX_SEEDS; s++) {
+    if (operationCancelled()) break;
+    var resolved = null;
+    try {
+      resolved = resolveRelatedSeed(list[s]);
+    } catch (resolveError) {
+      failed++;
+      lastError = resolveError && resolveError.message ? resolveError.message : String(resolveError);
+      log.debug("Related seed resolution failed:", lastError);
+      continue;
+    }
+    if (!resolved) continue;
+    excludedIDs[resolved.id] = true;
+    if (resolved.isrc) excludedISRCs[resolved.isrc] = true;
+    if (!resolved.albumID) continue;
+    try {
+      lists.push(relatedTracksFromAlbums(fetchRelatedAlbums(resolved.albumID)));
+      succeeded++;
+    } catch (relatedError) {
+      failed++;
+      lastError = relatedError && relatedError.message ? relatedError.message : String(relatedError);
+      log.debug("Related albums request failed:", lastError);
+    }
+  }
+
+  if (succeeded === 0 && failed > 0) {
+    throw new Error("Apple Music related tracks failed: " + lastError);
+  }
+
+  var results = [];
+  var seenIDs = {};
+  var seenISRCs = {};
+  for (var round = 0; results.length < limit; round++) {
+    var remaining = false;
+    for (var l = 0; l < lists.length && results.length < limit; l++) {
+      var track = lists[l][round];
+      if (!track) continue;
+      remaining = true;
+      var trackISRC = String(track.isrc || "").trim().toUpperCase();
+      if (!track.id || excludedIDs[track.id] || seenIDs[track.id]) continue;
+      if (trackISRC && (excludedISRCs[trackISRC] || seenISRCs[trackISRC])) continue;
+      seenIDs[track.id] = true;
+      if (trackISRC) seenISRCs[trackISRC] = true;
+      results.push(track);
+    }
+    if (!remaining) break;
+  }
+
+  log.info("Apple Music related tracks:", results.length, "from", succeeded, "seed(s)");
+  return results;
 }
 
 // ============================================
@@ -2448,6 +2656,17 @@ function ttmlToLyricsResult(parsed) {
 
   if (lines.length === 0) return null;
 
+  // Apple serves only plain text for some tracks (itunes:timing="None"), sometimes with every
+  // line stamped 0. Reporting that as LINE_SYNCED made every line "[00:00.00]". Several lines
+  // that all start at the same moment carry no timing, so they are reported as UNSYNCED.
+  var hasRealTiming = String(parsed.timingMode || "").toLowerCase() !== "none";
+  if (hasRealTiming && lines.length > 1) {
+    hasRealTiming = false;
+    for (var ti = 1; ti < lines.length; ti++) {
+      if (lines[ti].startTimeMs !== lines[0].startTimeMs) { hasRealTiming = true; break; }
+    }
+  }
+
   // Append translation lines after main lyrics (with blank separator)
   if (hasTranslation && translationLines.length > 0) {
     // Add separator
@@ -2467,7 +2686,7 @@ function ttmlToLyricsResult(parsed) {
 
   return {
     lines: lines,
-    syncType: "LINE_SYNCED",
+    syncType: hasRealTiming ? "LINE_SYNCED" : "UNSYNCED",
     instrumental: false,
     plainLyrics: plainParts.join("\n"),
     provider: "Apple Music"
@@ -2690,6 +2909,7 @@ registerExtension({
   getConcert: getConcert,
   getPlaylist: getPlaylist,
   getHomeFeed: getHomeFeed,
+  getRelatedTracks: getRelatedTracks,
   searchTracks: searchTracks,
   enrichTrack: enrichTrack,
   fetchLyrics: fetchLyrics

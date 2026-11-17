@@ -42,7 +42,7 @@ function load(respond, overrides = {}) {
   };
 }
 
-for (const code of ['QUALITY_UNAVAILABLE', 'TRACK_UNAVAILABLE', 'TRACK_NOT_FOUND']) {
+for (const code of ['QUALITY_UNAVAILABLE', 'TRACK_UNAVAILABLE', 'TRACK_NOT_FOUND', 'ATMOS_UNAVAILABLE']) {
   test(`${code} immediately tries FLAC after unavailable Atmos`, () => {
     const app = load(({ body }) => body.endpoint === 'manifests'
       ? { statusCode: 404, error: 'No matching catalog rendition', code, retryable: false, retryMode: 'none' }
@@ -53,12 +53,56 @@ for (const code of ['QUALITY_UNAVAILABLE', 'TRACK_UNAVAILABLE', 'TRACK_NOT_FOUND
   });
 }
 
+test('the Python utilities Atmos 502 response falls back without retrying Atmos', () => {
+  const app = load(({ body }) => body.endpoint === 'manifests'
+    ? { statusCode: 502, status: 502, error: 'Dolby Atmos unavailable (HTTP 502 Bad Gateway)',
+        code: 'ATMOS_UNAVAILABLE', retryable: false, retryMode: 'none' }
+    : flac());
+  assert.equal(app.fetch().resolvedQuality, 'HI_RES_LOSSLESS');
+  assert.deepEqual(app.qualities(), ['DOLBY_ATMOS', 'HI_RES_LOSSLESS']);
+  assert.deepEqual(app.sleeps, []);
+});
+
 test('confirmed missing Atmos and hi-res tries CD FLAC', () => {
   const app = load(({ body }) => body.quality === 'LOSSLESS' ? flac('LOSSLESS')
     : { error: 'Requested quality unavailable', code: 'QUALITY_UNAVAILABLE', retryable: false, retryMode: 'none' });
   assert.equal(app.fetch().resolvedQuality, 'LOSSLESS');
   assert.deepEqual(app.qualities(), ['DOLBY_ATMOS', 'HI_RES_LOSSLESS', 'LOSSLESS']);
   assert.deepEqual(app.sleeps, []);
+});
+
+test('Max accepts a returned CD FLAC stream without discarding it and requesting again', () => {
+  const app = load(() => flac('LOSSLESS'));
+  const result = app.fetch('HI_RES_LOSSLESS');
+  assert.equal(result.resolvedQuality, 'LOSSLESS');
+  assert.equal(result.requestedQuality, 'HI_RES_LOSSLESS');
+  assert.equal(result.bitDepth, 16);
+  assert.deepEqual(app.qualities(), ['HI_RES_LOSSLESS']);
+  assert.equal(app.ticketCount(), 1);
+});
+
+for (const sampleRate of [44100, 48000, 96000]) {
+  test(`Max rejects a lossy ${sampleRate} Hz response and tries the lossless tier`, () => {
+    const app = load(({ body }) => body.quality === 'LOSSLESS' ? flac('LOSSLESS') : ok({ data: {
+      audioQuality: 'HIGH', sampleRate,
+      manifest: Buffer.from(JSON.stringify({ urls: ['https://offline.invalid/audio.m4a'], mimeType: 'audio/mp4' })).toString('base64'),
+    } }));
+    assert.equal(app.fetch('HI_RES_LOSSLESS').resolvedQuality, 'LOSSLESS');
+    assert.deepEqual(app.qualities(), ['HI_RES_LOSSLESS', 'LOSSLESS']);
+  });
+}
+
+test('a Max mirror response can supply CD FLAC without a second network request', () => {
+  const app = load(() => ({ statusCode: 503, error: 'Temporary failure' }));
+  let mirrorCalls = 0;
+  app.context.CONFIG.mirrorBaseURLs = ['https://mirror.example.test'];
+  app.context.fetchMirrorDownloadInfo = () => {
+    mirrorCalls++;
+    return { kind: 'direct', directURL: 'https://mirror.example.test/song.flac', bitDepth: 16, sampleRate: 44100, manifestMimeType: 'audio/flac' };
+  };
+  assert.equal(app.fetch('HI_RES_LOSSLESS').resolvedQuality, 'LOSSLESS');
+  assert.equal(mirrorCalls, 1);
+  assert.equal(app.mediaCalls().length, 1);
 });
 
 for (const error of ['Requested quality unavailable', 'track not available']) {
@@ -155,4 +199,62 @@ test('explicitly retryable track unavailability does not confirm quality absence
   assert.equal(app.mediaCalls().length, 5);
   assert.equal(app.ticketCount(), 1);
   assert.ok(app.qualities().every(quality => quality === 'DOLBY_ATMOS'));
+});
+
+test('a long ticket rate limit stops later tracks without another ticket request', () => {
+  const app = load(() => ({ statusCode: 200 }));
+  const original = app.context.session.signedFetch;
+  let ticketCalls = 0;
+  app.context.session.signedFetch = (method, url, body, headers) => {
+    if (url === '/tickets') {
+      ticketCalls++;
+      return { statusCode: 429, error: 'Temporarily blocked', retryAfterSeconds: 3600 };
+    }
+    return original(method, url, body, headers);
+  };
+  assert.throws(() => app.fetch('LOSSLESS'), error => error.code === 'RESOLUTION_TIMEOUT' || /rate limited|Temporarily blocked/.test(error.message));
+  assert.equal(ticketCalls, 1);
+  for (const trackID of ['222', '333', '444']) {
+    assert.throws(() => app.context.fetchDownloadInfo(trackID, 'LOSSLESS'), error => error.code === 'RESOLUTION_TIMEOUT');
+  }
+  assert.equal(ticketCalls, 1, 'the blocked client must not ask for tickets again');
+});
+
+test('a long ticket block is asked again after the cap, so a new network recovers', () => {
+  const app = load(() => flac('LOSSLESS'));
+  const clock = { now: 1_000_000 };
+  app.context.clock = clock;
+  vm.runInContext('Date.now = function () { return clock.now; };', app.context);
+  const original = app.context.session.signedFetch;
+  let refused = true;
+  let ticketCalls = 0;
+  app.context.session.signedFetch = (method, url, body, headers) => {
+    if (url === '/tickets') {
+      ticketCalls++;
+      if (refused) return { statusCode: 429, error: 'Temporarily blocked', retryAfterSeconds: 75151 };
+    }
+    return original(method, url, body, headers);
+  };
+  assert.throws(() => app.fetch('LOSSLESS'));
+  assert.equal(ticketCalls, 1);
+
+  clock.now += 14 * 60 * 1000;
+  assert.throws(() => app.context.fetchDownloadInfo('222', 'LOSSLESS'), error => error.code === 'RESOLUTION_TIMEOUT');
+  assert.equal(ticketCalls, 1, 'still inside the capped wait');
+
+  refused = false;
+  clock.now += 2 * 60 * 1000;
+  assert.equal(app.context.fetchDownloadInfo('333', 'LOSSLESS').resolvedQuality, 'LOSSLESS');
+  assert.equal(ticketCalls, 2);
+});
+
+test('a short ticket rate limit is not remembered across tracks', () => {
+  const app = load(() => ({ statusCode: 200 }));
+  let ticketCalls = 0;
+  app.context.session.signedFetch = (method, url) => {
+    if (url === '/tickets') { ticketCalls++; return ticketCalls === 1 ? { statusCode: 429, error: 'slow down', retryAfterSeconds: 2 } : ok({ ticket_id: 't' + ticketCalls }); }
+    return flac('LOSSLESS');
+  };
+  assert.equal(app.fetch('LOSSLESS').resolvedQuality, 'LOSSLESS');
+  assert.ok(ticketCalls >= 2);
 });

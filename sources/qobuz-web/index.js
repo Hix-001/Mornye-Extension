@@ -15,6 +15,7 @@ var CONFIG = {
   metadataCacheTtlMs: 5 * 60 * 1000,
   searchCacheTtlMs: 60 * 1000,
   negativeCacheTtlMs: 30 * 1000,
+  previewCacheTtlMs: 60 * 60 * 1000,
   metadataCacheMaxEntries: 500,
   maxDownloadAttempts: 5,
   metadataAttempts: 3,
@@ -22,8 +23,12 @@ var CONFIG = {
   retryMaxDelayMs: 4000,
   downloadProviders: [
     { name: "zarz-v2", url: "/dl/qbz" }
-  ]
+  ],
+  customEndpoint: "",
+  customEndpointApiKey: ""
 };
+
+var DEFAULT_DOWNLOAD_PROVIDERS = CONFIG.downloadProviders.slice();
 
 var STORE_TRACK_ID_REGEX = /\/v4\/ajax\/popin-add-cart\/track\/([0-9]+)/g;
 var LOCALE_SEGMENT_REGEX = /^[a-z]{2}-[a-z]{2}$/i;
@@ -410,7 +415,52 @@ function initialize(settings) {
     CONFIG.countryCode = countryCode;
   }
 
+  // A user-hosted qobuz-rest-api compatible server is tried before the default API.
+  CONFIG.customEndpoint = normalizeCustomEndpoint(settings.customEndpoint);
+  CONFIG.customEndpointApiKey = String(settings.customEndpointApiKey || "").trim();
+  CONFIG.downloadProviders = (CONFIG.customEndpoint ? [{ name: "custom", custom: true }] : [])
+    .concat(DEFAULT_DOWNLOAD_PROVIDERS);
+
   return true;
+}
+
+// Keeps the scheme the user typed: the host app allows plain HTTP only for a
+// host granted by a "grantsNetwork" setting.
+function normalizeCustomEndpoint(value) {
+  var text = String(value || "").trim();
+  if (!/^https?:\/\/[^\/?#]+/i.test(text)) return "";
+  return text.replace(/[?#].*$/, "").replace(/\/+$/, "");
+}
+
+function mapCustomEndpointQuality(qualityCode) {
+  switch (String(qualityCode || "").trim()) {
+    case "27":
+      return "hi96";
+    case "7":
+      return "hi24";
+    default:
+      return "flac";
+  }
+}
+
+// GET {endpoint}/download-url/{trackID}?quality=... as served by qobuz-rest-api.
+function fetchCustomDownloadInfo(provider, trackID, qualityCode) {
+  var url = CONFIG.customEndpoint + "/download-url/" + encodeURIComponent(String(trackID || "").trim()) +
+    "?quality=" + encodeURIComponent(mapCustomEndpointQuality(qualityCode));
+  var headers = requestHeaders(url);
+  if (CONFIG.customEndpointApiKey) headers["X-API-Key"] = CONFIG.customEndpointApiKey;
+  var response = http.get(url, headers);
+  if (!response || response.error) {
+    throw new Error("custom endpoint: " + (response && response.error ? response.error : "request failed"));
+  }
+  if (response.statusCode !== 200) {
+    throw new Error("custom endpoint: HTTP " + response.statusCode + summarizeErrorBody(response.body));
+  }
+  var info = parseDownloadInfo(JSON.parse(response.body));
+  info.provider = provider.name;
+  info.qualityCode = qualityCode;
+  info.candidateKey = provider.name + "@" + qualityCode;
+  return info;
 }
 
 function cleanup() {
@@ -994,7 +1044,13 @@ function artistNamesMatch(expected, found) {
 }
 
 function stripTrackTitleAnnotations(value) {
-  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, " ");
+  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, function(annotation) {
+    if (/^[(\[]\s*with\b/i.test(annotation) &&
+        /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/i.test(annotation)) {
+      return annotation;
+    }
+    return " ";
+  });
 }
 
 function normalizeTrackIdentityTitle(value) {
@@ -1206,15 +1262,21 @@ function qobuzSignedURL(objectName, methodName, params) {
   return CONFIG.previewApiBaseURL + "/api.json/0.2/" + objectName + "/" + methodName + "?" + query.join("&");
 }
 
-function qobuzPreviewURL(track) {
+function previewTrackID(track) {
   if (!track) return "";
-
-  var trackID = String(track.id || "").trim();
-  if (!trackID) return "";
-
   if (track.previewable === false && track.sampleable === false && track.streamable === false) {
     return "";
   }
+  return String(track.id || "").trim();
+}
+
+function qobuzPreviewURL(track) {
+  var trackID = previewTrackID(track);
+  if (!trackID) return "";
+
+  var cacheKey = "preview:" + trackID;
+  var cached = metadataCacheGet(cacheKey);
+  if (cached !== null) return cached;
 
   try {
     var url = qobuzSignedURL("track", "getFileUrl", {
@@ -1226,13 +1288,25 @@ function qobuzPreviewURL(track) {
       "X-App-Id": CONFIG.previewAppID
     }));
     var preview = String(payload && payload.url || "").trim();
-    if (!preview) return "";
-    if (payload.sample === false && Number(payload.duration || 0) > 45) return "";
-    return preview;
+    if (preview && payload.sample === false && Number(payload.duration || 0) > 45) preview = "";
+    // Sample links stay valid for a day; cache them below that.
+    return metadataCacheSet(cacheKey, preview, preview ? CONFIG.previewCacheTtlMs : CONFIG.negativeCacheTtlMs);
   } catch (e) {
     log.warn("[QobuzWeb] Preview URL unavailable for track " + trackID + ": " + e.message);
     return "";
   }
+}
+
+// The host (deferredPreview runtime feature) plays this link through
+// resolvePreview, so a search needs no sample lookup per track.
+function deferredPreviewURL(track) {
+  var trackID = previewTrackID(track);
+  return trackID ? "mornye-preview:qobuz-web/" + encodeURIComponent(trackID) : "";
+}
+
+function resolvePreview(input) {
+  var trackID = parseTrackID(input && typeof input === "object" ? input.id : input);
+  return { preview_url: trackID ? qobuzPreviewURL({ id: trackID }) : "" };
 }
 
 function shouldRetryMetadataError(error) {
@@ -1597,7 +1671,7 @@ function formatTrack(track, totalDiscsOverride, options) {
   };
 
   if (options.includePreview) {
-    var previewURL = qobuzPreviewURL(track);
+    var previewURL = deferredPreviewURL(track);
     if (previewURL) formatted.preview_url = previewURL;
   }
 
@@ -2135,6 +2209,7 @@ function searchAlbumsViaAPI(query, limit) {
 function selectTracksFromAlbumSearch(query, summaries, limit) {
   var candidates = [];
   var seen = {};
+  var lastError = null;
 
   for (var i = 0; i < summaries.length; i++) {
     if (ensureNotCancelled()) throw new Error("download cancelled");
@@ -2146,6 +2221,7 @@ function selectTracksFromAlbumSearch(query, summaries, limit) {
       album = fetchAlbumRaw(albumID);
     } catch (e) {
       if (isTerminalLookupError(e)) throw e;
+      lastError = preferredLookupError(lastError, e);
       continue;
     }
 
@@ -2188,6 +2264,7 @@ function selectTracksFromAlbumSearch(query, summaries, limit) {
     }
   }
 
+  if (!candidates.length && lastError) throw lastError;
   candidates.sort(function(a, b) {
     if (a.score !== b.score) return b.score - a.score;
     if (Number(a.track.maximum_bit_depth || 0) !== Number(b.track.maximum_bit_depth || 0)) {
@@ -2254,7 +2331,7 @@ function searchTracksWithFallback(query, limit, selectMatch, maxSources) {
       if (tracks.length && (!selectMatch || selectMatch(tracks))) return tracks;
     } catch (e) {
       if (isTerminalLookupError(e)) throw e;
-      lastError = e;
+      lastError = preferredLookupError(lastError, e);
     }
   }
   if (lastError) throw lastError;
@@ -2273,6 +2350,12 @@ function isTerminalLookupError(error) {
     /cancelled|execution timeout exceeded/i.test(String(error && error.message || error));
 }
 
+function preferredLookupError(previous, current) {
+  // Keep throttling visible even if a later storefront fallback returns 403.
+  if (previous && /HTTP\s+429\b|RATE_LIMIT/i.test(String(previous.code || "") + " " + previous.message)) return previous;
+  return current;
+}
+
 function findVerifiedSearchTrack(isrc, trackName, artistName, expectedDurationMs, albumName, albumArtistName) {
   var queries = [];
   var seen = {};
@@ -2281,8 +2364,14 @@ function findVerifiedSearchTrack(isrc, trackName, artistName, expectedDurationMs
   // A title-only query helps when the provider tokenizes artist credits differently.
   // Keep the original title (including version labels) and all match safeguards.
   uniquePush(queries, String(trackName || "").trim(), seen);
+  var strippedTitle = stripTrackTitleAnnotations(trackName).replace(/\s+/g, " ").trim();
+  if (strippedTitle && strippedTitle !== String(trackName || "").trim()) {
+    uniquePush(queries, (strippedTitle + " " + String(artistName || "")).trim(), seen);
+    uniquePush(queries, strippedTitle, seen);
+  }
   var best = null;
   var provisional = null;
+  var lastError = null;
   var albumTitle = albumSearchTitle(albumName) || String(albumName || "").trim();
   if (albumTitle) {
     best = findVerifiedSourceAlbumTrack(isrc, trackName, artistName, expectedDurationMs,
@@ -2307,13 +2396,20 @@ function findVerifiedSearchTrack(isrc, trackName, artistName, expectedDurationMs
       }
     } catch (e) {
       if (isTerminalLookupError(e)) throw e;
+      lastError = preferredLookupError(lastError, e);
       log.warn("[QobuzWeb] Search query failed: " + (e && e.message || e));
     }
   }
 
   if (albumTitle) {
-    best = findVerifiedSourceAlbumTrack(isrc, trackName, artistName, expectedDurationMs,
-      albumTitle, albumArtistName, false);
+    best = null;
+    try {
+      best = findVerifiedSourceAlbumTrack(isrc, trackName, artistName, expectedDurationMs,
+        albumTitle, albumArtistName, false);
+    } catch (albumError) {
+      if (isTerminalLookupError(albumError)) throw albumError;
+      lastError = preferredLookupError(lastError, albumError);
+    }
     if (best) return best;
     // Expensive album/store hydration for each track query comes last. It must
     // not consume the 30-second availability call before the source album.
@@ -2326,18 +2422,31 @@ function findVerifiedSearchTrack(isrc, trackName, artistName, expectedDurationMs
         if (best) return best;
       } catch (fallbackError) {
         if (isTerminalLookupError(fallbackError)) throw fallbackError;
+        lastError = preferredLookupError(lastError, fallbackError);
         log.warn("[QobuzWeb] Search fallback failed: " + (fallbackError && fallbackError.message || fallbackError));
       }
     }
   }
+  if (!provisional && lastError) throw lastError;
   return provisional;
 }
 
 // Validate cached albums first for subsequent tracks in the same release.
 function findVerifiedSourceAlbumTrack(isrc, trackName, artistName, expectedDurationMs,
   albumTitle, albumArtistName, cachedOnly) {
+  var releaseKey = "source-release:" + JSON.stringify([
+    normalizeSearchText(albumTitle), normalizeSearchText(albumArtistName)
+  ]);
+  var knownAlbumID = metadataCacheGet(releaseKey);
+  if (knownAlbumID && metadataCacheGet("album:" + knownAlbumID)) {
+    if (ensureNotCancelled()) throw new Error("download cancelled");
+    var knownTracks = selectTracksFromAlbumSearch(trackName, [{ id: knownAlbumID }], 0);
+    var knownMatch = selectBestSearchTrack(knownTracks, isrc, trackName, artistName, expectedDurationMs);
+    if (knownMatch) return knownMatch;
+  }
   var albumQueries = [];
   var seenQueries = {};
+  var lastError = null;
   // Strip only soundtrack annotations before qualifying the query. A short
   // title alone (e.g. Race) can bury the source release behind other albums.
   var sourceAlbumArtist = String(albumArtistName || "").trim();
@@ -2370,14 +2479,20 @@ function findVerifiedSourceAlbumTrack(isrc, trackName, artistName, expectedDurat
       var candidates = selectTracksFromAlbumSearch(trackName, summaries, 0);
       var best = selectBestSearchTrack(candidates, isrc, trackName, artistName, expectedDurationMs);
       if (best) {
+        // Soundtracks have different singers on each song. Remember the
+        // verified release independently of the singer-qualified search query.
+        var matchedAlbumID = parseAlbumID(best.album && best.album.id);
+        if (matchedAlbumID) metadataCacheSet(releaseKey, matchedAlbumID);
         log.info("[QobuzWeb] Recovered track from source album metadata: " + best.id);
         return best;
       }
     } catch (albumError) {
       if (isTerminalLookupError(albumError)) throw albumError;
+      lastError = preferredLookupError(lastError, albumError);
       log.warn("[QobuzWeb] Source album search failed: " + (albumError && albumError.message || albumError));
     }
   }
+  if (lastError) throw lastError;
   return null;
 }
 
@@ -2640,6 +2755,7 @@ function providerRequestURL(provider, trackID, qualityCode) {
 }
 
 function fetchProviderDownloadInfo(provider, trackID, qualityCode) {
+  if (provider && provider.custom) return fetchCustomDownloadInfo(provider, trackID, qualityCode);
   var attempts = CONFIG.maxDownloadAttempts;
   var lastError = null;
   var trackURL = CONFIG.openBaseURL + "/track/" + String(trackID || "").trim();
@@ -2970,10 +3086,21 @@ function download(trackID, quality, outputPath, onProgress, options) {
       var downloadResult = downloadDirectFile(downloadInfo.directURL, actualOutputPath, onProgress, 10, 82);
       if (!downloadResult || !downloadResult.success) {
         deleteQuietly(actualOutputPath);
+        var transferError = downloadResult && downloadResult.error ? String(downloadResult.error) : "unknown error";
+        var cancelled = (downloadResult && downloadResult.error_type === "cancelled") ||
+          /cancelled/i.test(transferError) || ensureNotCancelled();
+        if (!cancelled && downloadInfo.provider === "custom" && attempt + 1 < maxDownloadAttempts) {
+          var rejectedQualities = qualityFallbackChain(quality);
+          for (var q = 0; q < rejectedQualities.length; q++) {
+            rejectedDownloadCandidates["custom@" + rejectedQualities[q]] = true;
+          }
+          log.warn("[QobuzWeb] Custom stream failed, trying the default download provider");
+          continue;
+        }
         return {
           success: false,
-          error_message: "Failed to download Qobuz stream: " + (downloadResult && downloadResult.error ? downloadResult.error : "unknown error"),
-          error_type: "download_error"
+          error_message: "Failed to download Qobuz stream: " + transferError,
+          error_type: cancelled ? "cancelled" : "download_error"
         };
       }
 
@@ -3145,7 +3272,8 @@ registerExtension({
   getArtist: getArtist,
   getPlaylist: getPlaylist,
   enrichTrack: enrichTrack,
-  searchTracks: searchTracks
+  searchTracks: searchTracks,
+  resolvePreview: resolvePreview
 });
 
 log.info("[QobuzWeb] Qobuz extension loaded");

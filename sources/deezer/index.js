@@ -664,7 +664,7 @@ function formatTrack(trackData, context) {
     composer: composerNames(trackData, gatewayTrack),
     comment: albumURL,
     explicit: isExplicit,
-    audio_quality: "16bit/44.1kHz"
+    audio_quality: trackAudioQuality(trackData, gatewayTrack)
   };
 }
 
@@ -1158,10 +1158,20 @@ function resolveTrackIDFromISRC(isrc) {
   }
 }
 
-function findBestSearchMatch(tracks, trackName, artistName) {
+function stripTrackTitleAnnotations(value) {
+  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, function(annotation) {
+    if (/^[(\[]\s*with\b/i.test(annotation) &&
+        /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/i.test(annotation)) {
+      return annotation;
+    }
+    return " ";
+  });
+}
+
+function findBestSearchMatch(tracks, trackName, artistName, durationMs) {
   if (!tracks || !tracks.length) return null;
 
-  var normalizedTrack = matching.normalizeString(trackName || "");
+  var normalizedTrack = matching.normalizeString(stripTrackTitleAnnotations(trackName));
   var normalizedArtist = matching.normalizeString(artistName || "");
   var best = null;
   var bestScore = 0;
@@ -1173,12 +1183,20 @@ function findBestSearchMatch(tracks, trackName, artistName) {
     var score = 0;
     var title = track.title || "";
     var artist = track.artist && track.artist.name ? track.artist.name : "";
+    var normalizedTitle = matching.normalizeString(stripTrackTitleAnnotations(title));
+    var version = /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/;
+    if (normalizedTrack !== normalizedTitle &&
+        (version.test(normalizedTrack) || version.test(normalizedTitle))) continue;
+    var artistScore = matching.compareStrings(normalizedArtist, matching.normalizeString(artist));
+    if (normalizedArtist && artistScore < 0.5) continue;
+    var candidateDuration = Number(track.duration || 0) * 1000;
+    if (durationMs > 0 && candidateDuration > 0 && Math.abs(durationMs - candidateDuration) > 15000) continue;
 
     if (normalizedTrack) {
-      score += matching.compareStrings(normalizedTrack, matching.normalizeString(title)) * 70;
+      score += matching.compareStrings(normalizedTrack, normalizedTitle) * 70;
     }
     if (normalizedArtist) {
-      score += matching.compareStrings(normalizedArtist, matching.normalizeString(artist)) * 30;
+      score += artistScore * 30;
     }
 
     if (score > bestScore) {
@@ -1191,7 +1209,7 @@ function findBestSearchMatch(tracks, trackName, artistName) {
   return best;
 }
 
-function resolveTrackIDBySearch(trackName, artistName) {
+function resolveTrackIDBySearch(trackName, artistName, durationMs) {
   var query = String(trackName || "").trim();
   if (artistName) {
     query += " " + String(artistName).trim();
@@ -1199,10 +1217,20 @@ function resolveTrackIDBySearch(trackName, artistName) {
   query = query.trim();
   if (!query) return "";
 
+  var queries = [query];
+  var strippedTitle = stripTrackTitleAnnotations(trackName).replace(/\s+/g, " ").trim();
+  if (strippedTitle && strippedTitle !== String(trackName || "").trim()) {
+    var strippedQuery = (strippedTitle + " " + (artistName || "")).trim();
+    if (queries.indexOf(strippedQuery) < 0) queries.push(strippedQuery);
+  }
   try {
-    var data = deezerGet("/search?q=" + encodeURIComponent(query) + "&limit=10");
-    var best = findBestSearchMatch(data && data.data ? data.data : [], trackName, artistName);
-    return best && best.id ? String(best.id) : "";
+    for (var i = 0; i < queries.length; i++) {
+      if (utils && typeof utils.isDownloadCancelled === "function" && utils.isDownloadCancelled()) return "";
+      var data = deezerGet("/search?q=" + encodeURIComponent(queries[i]) + "&limit=10");
+      var best = findBestSearchMatch(data && data.data ? data.data : [], trackName, artistName, durationMs);
+      if (best && best.id) return String(best.id);
+    }
+    return "";
   } catch (e) {
     log.debug("[DeezerExt] search resolve failed:", e.message);
     return "";
@@ -1220,7 +1248,7 @@ function resolveTrackID(isrc, trackName, artistName, options) {
     if (deezerID) return deezerID;
   }
 
-  return resolveTrackIDBySearch(trackName, artistName);
+  return resolveTrackIDBySearch(trackName, artistName, Number(options.duration_ms || options.track && options.track.duration_ms || 0));
 }
 
 function checkAvailability(isrc, trackName, artistName, options) {
@@ -1289,6 +1317,15 @@ function descriptorRequiresClientDecryption(descriptor) {
   return parseBoolean(descriptor.deezer_encrypted, false);
 }
 
+// The CDN may serve the media of another Deezer song entry for the same recording. The file is
+// encrypted with the key of the entry named in the media path
+// (/media/<a>/<b>/<c>/<d>/<e>/<SNG_ID>/<hash>.<ext>), not of the entry that was looked up.
+// This covers resolvers that do not report deezer_track_id.
+function mediaSongIDFromURL(url) {
+  var match = /\/media\/(?:\d+\/){1,6}(\d{3,})\/[0-9a-f]{16,}\.[a-z0-9]+(?:[?#]|$)/i.exec(String(url || ""));
+  return match ? match[1] : "";
+}
+
 function decryptDownloadedFile(encryptedPath, outputPath, trackID, onProgress) {
   var keyHex = generateBlowfishKeyHex(trackID);
   var transformResult = file.transformPatternedBlocks(
@@ -1320,6 +1357,55 @@ function decryptDownloadedFile(encryptedPath, outputPath, trackID, onProgress) {
     throw new Error(transformResult && transformResult.error ? transformResult.error : "failed to transform encrypted file");
   }
   return transformResult.path || outputPath;
+}
+
+function trackAudioQuality(trackData, gatewayTrack) {
+  var measured = cacheGet("audio-quality:" + String(trackData && trackData.id || ""));
+  if (measured) return measured;
+  var source = gatewayTrack || trackData || {};
+  if (Number(source.FILESIZE_FLAC_24 || 0) > 0) return "24-bit FLAC";
+  // Catalog metadata does not normally expose the source sample rate.
+  return "FLAC";
+}
+
+function descriptorOutputExtension(descriptor) {
+  var format = String(descriptor.deezer_source_format || descriptor.deezer_format || "FLAC").toUpperCase();
+  return format.indexOf("MP3") === 0 ? "mp3" : "flac";
+}
+
+function downloadedAudioQuality(filePath, descriptor) {
+  var measured = null;
+  try {
+    if (typeof gobackend !== "undefined" && gobackend && typeof gobackend.getAudioQuality === "function") {
+      measured = gobackend.getAudioQuality(filePath);
+      if (measured && measured.error) measured = null;
+    }
+  } catch (probeError) {
+    log.debug("[DeezerExt] Audio quality probe unavailable:", probeError.message);
+  }
+
+  var bitDepth = Number(measured && (measured.bitDepth || measured.bit_depth) || 0);
+  var sampleRate = Number(measured && (measured.sampleRate || measured.sample_rate) || 0);
+  if (!isFinite(bitDepth) || bitDepth < 8 || bitDepth > 32 || Math.floor(bitDepth) !== bitDepth) bitDepth = 0;
+  if (!isFinite(sampleRate) || sampleRate < 8000 || sampleRate > 768000 || Math.floor(sampleRate) !== sampleRate) sampleRate = 0;
+
+  var sourceFormat = String(descriptor.deezer_source_format || "").toUpperCase();
+  var codec = String(measured && measured.codec || descriptorOutputExtension(descriptor)).toLowerCase();
+  if (!bitDepth && codec === "flac") {
+    if (sourceFormat === "FLAC_24") bitDepth = 24;
+    else if (sourceFormat === "FLAC") bitDepth = 16;
+  }
+  var label = codec === "mp3" ? "MP3" : "FLAC";
+  if (bitDepth && sampleRate) label = bitDepth + "bit/" + (sampleRate / 1000) + "kHz";
+  else if (bitDepth) label = bitDepth + "-bit FLAC";
+
+  return {
+    bit_depth: bitDepth,
+    sample_rate: sampleRate,
+    audio_quality: label,
+    audio_codec: codec,
+    actual_container: codec === "mp3" ? "mp3" : "flac"
+  };
 }
 
 function download(trackID, quality, outputPath, onProgress, options) {
@@ -1364,7 +1450,7 @@ function download(trackID, quality, outputPath, onProgress, options) {
   }
 
   var requiresClientDecryption = descriptorRequiresClientDecryption(descriptor);
-  var normalizedOutputPath = ensureOutputExtension(outputPath, (descriptor.deezer_format || "flac").toLowerCase());
+  var normalizedOutputPath = ensureOutputExtension(outputPath, descriptorOutputExtension(descriptor));
   var encryptedPath = requiresClientDecryption ? buildEncryptedTempPath(normalizedOutputPath) : normalizedOutputPath;
 
   if (typeof onProgress === "function") {
@@ -1389,7 +1475,8 @@ function download(trackID, quality, outputPath, onProgress, options) {
   try {
     if (requiresClientDecryption) {
       var encryptedLocalPath = downloadResult.path || encryptedPath;
-      actualOutputPath = decryptDownloadedFile(encryptedLocalPath, normalizedOutputPath, resolvedTrackID, onProgress);
+      var mediaTrackID = parseTrackID(descriptor.deezer_track_id) || mediaSongIDFromURL(downloadURL) || resolvedTrackID;
+      actualOutputPath = decryptDownloadedFile(encryptedLocalPath, normalizedOutputPath, mediaTrackID, onProgress);
       file.delete(encryptedLocalPath);
     }
   } catch (e3) {
@@ -1400,6 +1487,11 @@ function download(trackID, quality, outputPath, onProgress, options) {
       error_message: "Failed to decrypt Deezer stream: " + e3.message,
       error_type: "decrypt_error"
     };
+  }
+
+  var audioQuality = downloadedAudioQuality(actualOutputPath, descriptor);
+  if (audioQuality.bit_depth && audioQuality.sample_rate) {
+    cacheSet("audio-quality:" + resolvedTrackID, audioQuality.audio_quality);
   }
 
   if (typeof onProgress === "function") {
@@ -1438,8 +1530,11 @@ function download(trackID, quality, outputPath, onProgress, options) {
     copyright: completeMetadata ? completeMetadata.copyright : "",
     comment: completeMetadata ? completeMetadata.comment : "",
     explicit: completeMetadata ? completeMetadata.explicit : false,
-    bit_depth: 16,
-    sample_rate: 44100
+    bit_depth: audioQuality.bit_depth,
+    sample_rate: audioQuality.sample_rate,
+    audio_quality: audioQuality.audio_quality,
+    audio_codec: audioQuality.audio_codec,
+    actual_container: audioQuality.actual_container
   };
 }
 
@@ -1448,6 +1543,175 @@ function searchTracks(query, limit) {
     limit: limit || 20,
     filter: "track"
   });
+}
+
+function seedArtistText(value) {
+  if (Array.isArray(value)) {
+    return uniqueValues(value.map(function(artist) {
+      return artist && typeof artist === "object" ? artist.name : artist;
+    })).join(", ");
+  }
+  return String(value || "").trim();
+}
+
+function normalizedISRC(value) {
+  return String(value || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+}
+
+function isOwnSeed(seed) {
+  return String(seed.provider_id || "").trim().toLowerCase() === "deezer";
+}
+
+// Returns the Deezer track for a seed, or null when it has no confident match.
+// Network and HTTP failures propagate so the caller can tell them apart.
+function resolveRelatedSeed(seed) {
+  if (isOwnSeed(seed)) {
+    var ownID = parseTrackID(seed.id);
+    return ownID ? { id: ownID, isrc: normalizedISRC(seed.isrc) } : null;
+  }
+
+  var isrc = normalizedISRC(seed.isrc);
+  if (isrc) {
+    var track = deezerGet("/track/isrc:" + encodeURIComponent(isrc));
+    if (!track || track.error || !track.id) return null;
+    return { id: String(track.id), isrc: normalizedISRC(track.isrc) || isrc };
+  }
+
+  var trackName = String(seed.name || "").trim();
+  var artistName = seedArtistText(seed.artists);
+  var query = (trackName + " " + artistName).trim();
+  if (!query) return null;
+  var data = deezerGet("/search?q=" + encodeURIComponent(query) + "&limit=10");
+  var best = findBestSearchMatch(data && data.data ? data.data : [], trackName, artistName);
+  return best && best.id ? { id: String(best.id), isrc: normalizedISRC(best.isrc) } : null;
+}
+
+function gatewaySongPreviewURL(song) {
+  var media = song && Array.isArray(song.MEDIA) ? song.MEDIA : [];
+  for (var i = 0; i < media.length; i++) {
+    if (media[i] && media[i].TYPE === "preview" && media[i].HREF) {
+      return String(media[i].HREF);
+    }
+  }
+  return "";
+}
+
+// Maps a gateway song onto the public API track shape so formatTrack can reuse
+// the search mapping, with the gateway record supplying artists and credits.
+function formatGatewaySong(song) {
+  if (!song || !song.SNG_ID) return null;
+  var title = String(song.SNG_TITLE || "").trim();
+  var version = String(song.VERSION || "").trim();
+  if (version && title.toLowerCase().indexOf(version.toLowerCase()) < 0) {
+    title += " " + version;
+  }
+  var picture = String(song.ALB_PICTURE || "").trim();
+  var album = song.ALB_ID ? {
+    id: String(song.ALB_ID),
+    title: String(song.ALB_TITLE || ""),
+    cover_xl: picture ? "https://cdn-images.dzcdn.net/images/cover/" + encodeURIComponent(picture) +
+      "/1000x1000-000000-80-0-0.jpg" : ""
+  } : null;
+  var artist = song.ART_ID ? { id: String(song.ART_ID), name: String(song.ART_NAME || "") } : null;
+  var trackData = {
+    id: String(song.SNG_ID),
+    title: title,
+    duration: numberValue(song.DURATION),
+    isrc: String(song.ISRC || ""),
+    preview: gatewaySongPreviewURL(song),
+    disk_number: song.DISK_NUMBER,
+    track_position: song.TRACK_NUMBER,
+    album: album,
+    artist: artist
+  };
+  return formatTrack(trackData, {
+    album: album,
+    artist: artist,
+    gatewayTrack: song,
+    albumID: album ? withPrefix(album.id) : "",
+    artistID: artist ? withPrefix(artist.id) : ""
+  });
+}
+
+function fetchTrackMix(trackID) {
+  var payload = gatewayCall("song.getSearchTrackMix", {
+    sng_id: String(trackID),
+    start_with_input_track: false
+  });
+  var songs = payload && Array.isArray(payload.data) ? payload.data : [];
+  var tracks = [];
+  for (var i = 0; i < songs.length; i++) {
+    var formatted = formatGatewaySong(songs[i]);
+    if (formatted) tracks.push(formatted);
+  }
+  return tracks;
+}
+
+function getRelatedTracks(seeds, options) {
+  var limit = Number(options && options.limit) || 25;
+  limit = Math.max(1, Math.min(50, Math.floor(limit)));
+  var list = Array.isArray(seeds) ? seeds.slice(0, 10) : [];
+  var excludedIDs = {};
+  var excludedISRCs = {};
+  var i;
+
+  for (i = 0; i < list.length; i++) {
+    var seed = list[i] || {};
+    var seedISRC = normalizedISRC(seed.isrc);
+    if (seedISRC) excludedISRCs[seedISRC] = true;
+    if (isOwnSeed(seed)) {
+      var seedID = parseTrackID(seed.id);
+      if (seedID) excludedIDs[seedID] = true;
+    }
+  }
+
+  var succeeded = false;
+  var lastError = null;
+  var groups = [];
+  var seen = {};
+  for (i = 0; i < list.length && i < 5; i++) {
+    var resolved = null;
+    try {
+      resolved = resolveRelatedSeed(list[i] || {});
+      if (!isOwnSeed(list[i] || {})) succeeded = true;
+    } catch (resolveError) {
+      lastError = resolveError;
+      log.debug("[DeezerExt] Related seed resolve failed:", resolveError.message);
+      continue;
+    }
+    if (!resolved || seen[resolved.id]) continue;
+    seen[resolved.id] = true;
+    excludedIDs[resolved.id] = true;
+    if (resolved.isrc) excludedISRCs[resolved.isrc] = true;
+    try {
+      groups.push(fetchTrackMix(resolved.id));
+      succeeded = true;
+    } catch (mixError) {
+      lastError = mixError;
+      log.debug("[DeezerExt] Track mix failed:", mixError.message);
+    }
+  }
+
+  if (!succeeded && lastError) throw lastError;
+
+  var results = [];
+  var added = {};
+  var maxLength = 0;
+  for (i = 0; i < groups.length; i++) {
+    maxLength = Math.max(maxLength, groups[i].length);
+  }
+  for (var position = 0; position < maxLength && results.length < limit; position++) {
+    for (i = 0; i < groups.length && results.length < limit; i++) {
+      var track = groups[i][position];
+      if (!track) continue;
+      var rawID = String(track.deezer_id || stripPrefix(track.id));
+      var trackISRC = normalizedISRC(track.isrc);
+      if (excludedIDs[rawID] || added[track.id] || (trackISRC && excludedISRCs[trackISRC])) continue;
+      added[track.id] = true;
+      results.push(track);
+    }
+  }
+  return results;
 }
 
 function completeGrant() {
@@ -1469,6 +1733,7 @@ registerExtension({
   getPlaylist: getPlaylist,
   enrichTrack: enrichTrack,
   searchTracks: searchTracks,
+  getRelatedTracks: getRelatedTracks,
   checkAvailability: checkAvailability,
   download: download,
   getDownloadUrl: function () { return null; }

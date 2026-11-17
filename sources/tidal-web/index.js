@@ -7,6 +7,7 @@ var CONFIG = {
   locale: "en_US",
   deviceType: "BROWSER",
   mirrorBaseURLs: [],
+  preferMirrors: false,
   maxAlbumItems: 1000,
   maxPlaylistTracks: 500,
   pageSize: 50,
@@ -62,6 +63,11 @@ function initialize(settings) {
     CONFIG.downloadAPIURL = downloadAPIURL;
   }
 
+  // A user-hosted hifi-api compatible server is tried before the default API.
+  var customEndpoint = normalizeCustomEndpoint(settings.customEndpoint);
+  CONFIG.mirrorBaseURLs = customEndpoint ? [customEndpoint] : [];
+  CONFIG.preferMirrors = !!customEndpoint;
+
   var countryCode = String(settings.countryCode || "").trim().toUpperCase();
   if (countryCode) {
     CONFIG.countryCode = countryCode;
@@ -99,6 +105,14 @@ function parseMirrorBaseURLs(value) {
     results.push(normalized);
   }
   return results;
+}
+
+// Keeps the scheme the user typed: the host app allows plain HTTP only for a
+// host granted by a "grantsNetwork" setting.
+function normalizeCustomEndpoint(value) {
+  var text = String(value || "").trim();
+  if (!/^https?:\/\/[^\/?#]+/i.test(text)) return "";
+  return text.replace(/[?#].*$/, "").replace(/\/+$/, "");
 }
 
 function normalizeMirrorBaseURL(value) {
@@ -378,13 +392,38 @@ function waitBeforeRetry(attempt, retryAfterMs) {
   return true;
 }
 
+// A long "Temporarily blocked" answer (HTTP 429 with a large Retry-After) applies to the
+// whole client, not to one track. Remember it so that the next track does not ask for
+// another ticket while the gateway is still refusing. Short limits are left to the
+// per-attempt backoff in fetchDownloadInfo. The gateway blocks by IP and can answer with many
+// hours, so the wait is capped: a client that moved to another network recovers on its own.
+var TICKET_BLOCK_MIN_MS = 60 * 1000;
+var TICKET_BLOCK_MAX_MS = 15 * 60 * 1000;
+var ticketBlock = { until: 0 };
+
 function signedTicket(provider, type, id) {
+  var blockedMs = ticketBlock.until - Date.now();
+  if (blockedMs > 0) {
+    var blocked = new Error(
+      "ticket service refused this client, next try in " + Math.ceil(blockedMs / 1000) + "s (no request sent)"
+    );
+    blocked.code = "RESOLUTION_TIMEOUT"; // ends the attempts like a spent resolution budget
+    blocked.retryAfterMs = blockedMs;
+    throw blocked;
+  }
   var resourceHash = utils.sha256(provider + ":" + (type || "track") + ":" + String(id || "").toLowerCase());
-  var payload = signedJSON("POST", "/tickets", {
-    capability: "download_ticket",
-    provider: provider,
-    resource_hash: resourceHash
-  });
+  var payload;
+  try {
+    payload = signedJSON("POST", "/tickets", {
+      capability: "download_ticket",
+      provider: provider,
+      resource_hash: resourceHash
+    });
+  } catch (ticketError) {
+    var waitMs = Number(ticketError && ticketError.retryAfterMs || 0);
+    if (waitMs >= TICKET_BLOCK_MIN_MS) ticketBlock.until = Date.now() + Math.min(waitMs, TICKET_BLOCK_MAX_MS);
+    throw ticketError;
+  }
   var ticketID = String(payload.ticket_id || payload.ticket || "").trim();
   if (!ticketID) {
     throw new Error("signed ticket response missing ticket_id");
@@ -692,7 +731,13 @@ function artistNamesMatch(expected, found) {
 }
 
 function stripTrackTitleAnnotations(value) {
-  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, " ");
+  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, function(annotation) {
+    if (/^[(\[]\s*with\b/i.test(annotation) &&
+        /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/i.test(annotation)) {
+      return annotation;
+    }
+    return " ";
+  });
 }
 
 function normalizeTrackIdentityTitle(value) {
@@ -928,13 +973,15 @@ function isHiResInfo(downloadInfo) {
 function isLosslessInfo(downloadInfo) {
   var audioQuality = String(downloadInfo && downloadInfo.audioQuality || "").toUpperCase();
   var mimeType = String(downloadInfo && downloadInfo.manifestMimeType || "").toLowerCase();
+  if (audioQuality === "HIGH" || audioQuality === "LOW" || isDolbyAtmosInfo(downloadInfo)) return false;
+  if (/audio\/(?:aac|mpeg|opus|eac3|ac3|ac4)\b/.test(mimeType)) return false;
   return isHiResInfo(downloadInfo) ||
     audioQuality === "LOSSLESS" ||
     mimeType.indexOf("audio/flac") >= 0;
 }
 
 function isCDLosslessInfo(downloadInfo) {
-  if (isHiResInfo(downloadInfo)) return false;
+  if (!isLosslessInfo(downloadInfo) || isHiResInfo(downloadInfo)) return false;
 
   var audioQuality = String(downloadInfo && downloadInfo.audioQuality || "").toUpperCase();
   var mimeType = String(downloadInfo && downloadInfo.manifestMimeType || "").toLowerCase();
@@ -951,7 +998,7 @@ function isCDLosslessInfo(downloadInfo) {
 function satisfiesQuality(downloadInfo, quality) {
   var normalized = normalizeDownloadQuality(quality);
   if (normalized === "DOLBY_ATMOS") return isDolbyAtmosInfo(downloadInfo);
-  if (normalized === "HI_RES_LOSSLESS") return isHiResInfo(downloadInfo);
+  if (normalized === "HI_RES_LOSSLESS") return isLosslessInfo(downloadInfo);
   if (normalized === "LOSSLESS") return isCDLosslessInfo(downloadInfo);
   return true;
 }
@@ -1054,7 +1101,7 @@ function fetchAPIDownloadInfo(trackID, quality, ticketID) {
 }
 
 function mirrorRequestURL(baseURL, trackID, quality) {
-  return normalizeMirrorBaseURL(baseURL) +
+  return String(baseURL || "").replace(/\/+$/, "") +
     "/track/?id=" + encodeURIComponent(String(trackID || "")) +
     "&quality=" + encodeURIComponent(normalizeDownloadQuality(quality));
 }
@@ -1069,7 +1116,7 @@ function fetchMirrorDownloadInfo(trackID, quality, rejectedCandidates) {
   rejectedCandidates = rejectedCandidates || {};
 
   for (var i = 0; i < mirrors.length; i++) {
-    var baseURL = normalizeMirrorBaseURL(mirrors[i]);
+    var baseURL = String(mirrors[i] || "").replace(/\/+$/, "");
     if (!baseURL) continue;
     var candidateKey = sourceCandidateKey("mirror", baseURL, quality);
     if (rejectedCandidates[candidateKey]) {
@@ -1144,11 +1191,29 @@ function isDeterministicDownloadError(error) {
   var code = String(error && error.code || "").toUpperCase();
   // Only catalog/quality absence confirms that a lower tier is worth trying.
   // Other terminal codes (auth, invalid tickets, etc.) must not downgrade audio.
-  if (code) return /^(TRACK_NOT_FOUND|TRACK_UNAVAILABLE|TRACK_NOT_AVAILABLE|QUALITY_UNAVAILABLE|QUALITY_NOT_AVAILABLE|CODEC_UNAVAILABLE)$/.test(code);
+  if (code) return /^(TRACK_NOT_FOUND|TRACK_UNAVAILABLE|TRACK_NOT_AVAILABLE|QUALITY_UNAVAILABLE|QUALITY_NOT_AVAILABLE|CODEC_UNAVAILABLE|ATMOS_UNAVAILABLE)$/.test(code);
   var message = String(error && error.message || error || "").trim();
   return /^(?:requested )?(?:track|quality|codec)(?: is)? (?:not available|unavailable|not found)(?:[.!]|$)/i.test(message) ||
     message === "TIDAL API did not report EAC3_JOC for this track" ||
     /^(?:Download API|mirror) returned PREVIEW asset$/.test(message);
+}
+
+function tryMirrorDownloadInfo(trackID, quality, candidate, attempt, rejectedCandidates, qualityErrors) {
+  try {
+    var mirrorDownloadInfo = fetchMirrorDownloadInfo(trackID, candidate, rejectedCandidates);
+    if (satisfiesQuality(mirrorDownloadInfo, candidate)) {
+      mirrorDownloadInfo.resolvedQuality = candidate === "HI_RES_LOSSLESS" && !isHiResInfo(mirrorDownloadInfo)
+        ? "LOSSLESS" : candidate;
+      mirrorDownloadInfo.requestedQuality = normalizeDownloadQuality(quality);
+      return mirrorDownloadInfo;
+    }
+    qualityErrors.push(candidate + " mirror attempt " + (attempt + 1) + ": returned lower tier than requested");
+  } catch (mirrorError) {
+    // Mirror failures may be transient (separate hosts), so they do not
+    // mark the attempt deterministic on their own.
+    qualityErrors.push(candidate + " mirror attempt " + (attempt + 1) + ": " + (mirrorError && mirrorError.message ? mirrorError.message : String(mirrorError)));
+  }
+  return null;
 }
 
 function fetchDownloadInfo(trackID, quality, rejectedCandidates) {
@@ -1177,13 +1242,20 @@ function fetchDownloadInfo(trackID, quality, rejectedCandidates) {
       // Atmos, preview-only, ...). Retrying it just wastes round-trips.
       var deterministic = false;
       var retryAfterMs = 0;
+      if (CONFIG.preferMirrors && candidate !== "DOLBY_ATMOS") {
+        var preferredDownloadInfo = tryMirrorDownloadInfo(trackID, quality, candidate, attempt, rejectedCandidates, qualityErrors);
+        if (preferredDownloadInfo) return preferredDownloadInfo;
+      }
       if (!apiExhausted) {
         try {
           if (!apiTicketID) apiTicketID = signedTicket("tid", "track", trackID);
           var apiDownloadInfo = fetchAPIDownloadInfo(trackID, candidate, apiTicketID);
           apiTicketID = "";
           if (satisfiesQuality(apiDownloadInfo, candidate)) {
-            apiDownloadInfo.resolvedQuality = candidate;
+            // Max is a preference. Keep a usable CD FLAC response rather than
+            // discarding it and risking another request for the same stream.
+            apiDownloadInfo.resolvedQuality = candidate === "HI_RES_LOSSLESS" && !isHiResInfo(apiDownloadInfo)
+              ? "LOSSLESS" : candidate;
             apiDownloadInfo.requestedQuality = normalizeDownloadQuality(quality);
             apiDownloadInfo.candidateKey = apiCandidateKey;
             return apiDownloadInfo;
@@ -1213,20 +1285,9 @@ function fetchDownloadInfo(trackID, quality, rejectedCandidates) {
         }
       }
 
-      if (candidate !== "DOLBY_ATMOS") {
-        try {
-          var mirrorDownloadInfo = fetchMirrorDownloadInfo(trackID, candidate, rejectedCandidates);
-          if (satisfiesQuality(mirrorDownloadInfo, candidate)) {
-            mirrorDownloadInfo.resolvedQuality = candidate;
-            mirrorDownloadInfo.requestedQuality = normalizeDownloadQuality(quality);
-            return mirrorDownloadInfo;
-          }
-          qualityErrors.push(candidate + " mirror attempt " + (attempt + 1) + ": returned lower tier than requested");
-        } catch (mirrorError) {
-          // Mirror failures may be transient (separate hosts), so they do not
-          // mark the attempt deterministic on their own.
-          qualityErrors.push(candidate + " mirror attempt " + (attempt + 1) + ": " + (mirrorError && mirrorError.message ? mirrorError.message : String(mirrorError)));
-        }
+      if (!CONFIG.preferMirrors && candidate !== "DOLBY_ATMOS") {
+        var mirrorDownloadInfo = tryMirrorDownloadInfo(trackID, quality, candidate, attempt, rejectedCandidates, qualityErrors);
+        if (mirrorDownloadInfo) return mirrorDownloadInfo;
       }
 
       // A deterministic API result will not change on retry, and with no mirror
@@ -1997,6 +2058,18 @@ function searchEndpoint(kind, query, limit) {
   })), CONFIG.searchCacheTtlMs);
 }
 
+function fetchTrackRadio(trackID, limit) {
+  var id = parseTrackID(trackID);
+  if (!id) throw new Error("Invalid TIDAL track ID: " + trackID);
+  var key = "radio:" + id + ":" + Number(limit || 0);
+  var cached = metadataCacheGet(key);
+  if (cached) return cached;
+  return metadataCacheSet(key, getJSON(buildMetadataURL("tracks/" + encodeURIComponent(id) + "/radio", {
+    limit: limit,
+    offset: 0
+  })));
+}
+
 function getTrack(trackID) {
   try {
     return hydrateRawTrack(fetchTrack(trackID));
@@ -2370,6 +2443,96 @@ function enrichTrack(track) {
   }
 }
 
+function resolveRelatedSeedID(seed) {
+  if (String(seed.provider_id || "").trim() === "tidal-web") {
+    return parseTrackID(seed.id);
+  }
+  var name = String(seed.name || "").trim();
+  var artists = String(seed.artists || "").trim();
+  if (!name) return "";
+  var candidates = searchOne((name + " " + artists).trim(), "track", 8);
+  var best = selectBestSearchTrack(
+    candidates,
+    seed.isrc,
+    name,
+    artists,
+    Number(seed.duration_ms || 0)
+  );
+  return best ? parseTrackID(best.id) : "";
+}
+
+function getRelatedTracks(seeds, options) {
+  var limit = Number(options && options.limit) || 25;
+  limit = Math.max(1, Math.min(50, Math.floor(limit)));
+  var list = Array.isArray(seeds) ? seeds.slice(0, 10) : [];
+
+  var excludedIDs = {};
+  var excludedISRCs = {};
+  for (var i = 0; i < list.length; i++) {
+    var seed = list[i] || {};
+    if (String(seed.provider_id || "").trim() === "tidal-web") {
+      var ownID = parseTrackID(seed.id);
+      if (ownID) excludedIDs[ownID] = true;
+    }
+    var seedISRC = String(seed.isrc || "").trim().toUpperCase();
+    if (seedISRC) excludedISRCs[seedISRC] = true;
+  }
+
+  var resolvedIDs = [];
+  var batches = [];
+  var succeeded = 0;
+  var lastError = null;
+  for (var j = 0; j < list.length && resolvedIDs.length < 5; j++) {
+    var seedID = "";
+    try {
+      seedID = resolveRelatedSeedID(list[j] || {});
+    } catch (e) {
+      lastError = e;
+      log.debug("[TidalWeb] related seed resolution failed: " + e.message);
+      continue;
+    }
+    if (!seedID || resolvedIDs.indexOf(seedID) >= 0) continue;
+    resolvedIDs.push(seedID);
+    excludedIDs[seedID] = true;
+
+    try {
+      var response = fetchTrackRadio(seedID, Math.min(50, limit + 1));
+      succeeded++;
+      var items = response && response.items || [];
+      var batch = [];
+      for (var k = 0; k < items.length; k++) {
+        var track = formatTrack(items[k]);
+        if (track) batch.push(track);
+      }
+      batches.push(batch);
+    } catch (radioError) {
+      lastError = radioError;
+      log.debug("[TidalWeb] track radio failed: " + radioError.message);
+    }
+  }
+
+  if (!succeeded && lastError) throw lastError;
+
+  var results = [];
+  var seen = {};
+  for (var round = 0; results.length < limit; round++) {
+    var added = false;
+    for (var b = 0; b < batches.length && results.length < limit; b++) {
+      var candidate = batches[b][round];
+      if (!candidate) continue;
+      added = true;
+      var candidateID = stripPrefix(candidate.id);
+      var candidateISRC = String(candidate.isrc || "").trim().toUpperCase();
+      if (seen[candidateID] || excludedIDs[candidateID]) continue;
+      if (candidateISRC && excludedISRCs[candidateISRC]) continue;
+      seen[candidateID] = true;
+      results.push(candidate);
+    }
+    if (!added) break;
+  }
+  return results;
+}
+
 function applyTrackMetadataToDownloadResult(result, track) {
   result = result || {};
   track = track || {};
@@ -2431,8 +2594,15 @@ function checkAvailability(isrc, trackName, artistName, options) {
 
     var queries = [query];
     var titleQuery = String(trackName || "").trim();
+    var strippedTitleQuery = stripTrackTitleAnnotations(titleQuery).replace(/\s+/g, " ").trim();
     var normalizedTitleQuery = normalizeTrackIdentityTitle(titleQuery);
-    [titleQuery, normalizedTitleQuery].forEach(function(candidateQuery) {
+    var simplerQueries = [titleQuery];
+    if (strippedTitleQuery && strippedTitleQuery !== titleQuery) {
+      simplerQueries.push((strippedTitleQuery + " " + (artistName || "")).trim());
+      simplerQueries.push(strippedTitleQuery);
+    }
+    simplerQueries.push(normalizedTitleQuery);
+    simplerQueries.forEach(function(candidateQuery) {
       if (candidateQuery && queries.indexOf(candidateQuery) < 0) {
         queries.push(candidateQuery);
       }
@@ -2524,8 +2694,10 @@ function download(trackID, quality, outputPath, onProgress, options) {
     var qualityInfo = null;
     var validation = { valid: true, preview: false, message: "" };
     var rejectedCandidates = {};
+    var maxTransfers = CONFIG.preferMirrors ? 3 : 2;
+    var refreshedExpiredStream = false;
 
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 0; attempt < maxTransfers; attempt++) {
       downloadInfo = fetchDownloadInfo(trackID, downloadQuality, rejectedCandidates);
       actualOutputPath = ensureOutputExtension(
         outputPath,
@@ -2545,14 +2717,25 @@ function download(trackID, quality, outputPath, onProgress, options) {
         deleteQuietly(actualOutputPath);
         var errorMessage = downloadResult && downloadResult.error ? downloadResult.error : "TIDAL download failed";
         var transferErrorType = downloadResult && downloadResult.error_type ? String(downloadResult.error_type) : "download_error";
-        if (transferErrorType === "expired_stream" && attempt === 0) {
+        var cancelled = transferErrorType === "cancelled" || /cancelled/i.test(errorMessage) ||
+          (utils && typeof utils.isDownloadCancelled === "function" && utils.isDownloadCancelled());
+        if (!cancelled && downloadInfo.mirrorBaseURL && CONFIG.preferMirrors && attempt + 1 < maxTransfers) {
+          var rejectedQualities = buildFallbackQualities(downloadQuality);
+          for (var q = 0; q < rejectedQualities.length; q++) {
+            rejectedCandidates[sourceCandidateKey("mirror", downloadInfo.mirrorBaseURL, rejectedQualities[q])] = true;
+          }
+          log.warn("[TidalWeb] Custom stream failed, trying the default download API");
+          continue;
+        }
+        if (!cancelled && transferErrorType === "expired_stream" && !refreshedExpiredStream && attempt + 1 < maxTransfers) {
+          refreshedExpiredStream = true;
           log.warn("[TidalWeb] Stream URL expired, resolving a fresh URL once");
           continue;
         }
         return {
           success: false,
           error_message: errorMessage,
-          error_type: errorMessage === "download cancelled" ? "cancelled" : transferErrorType,
+          error_type: cancelled ? "cancelled" : transferErrorType,
           retry_after_seconds: Number(downloadResult && downloadResult.retry_after_seconds || 0)
         };
       }
@@ -2566,7 +2749,7 @@ function download(trackID, quality, outputPath, onProgress, options) {
         break;
       }
       deleteQuietly(actualOutputPath);
-      if (!validation.preview || attempt === 1) {
+      if (!validation.preview || attempt + 1 === maxTransfers) {
         return {
           success: false,
           error_message: validation.message,
@@ -2698,7 +2881,8 @@ registerExtension({
   getArtist: getArtist,
   getPlaylist: getPlaylist,
   enrichTrack: enrichTrack,
-  searchTracks: searchTracks
+  searchTracks: searchTracks,
+  getRelatedTracks: getRelatedTracks
 });
 
 log.info("[TidalWeb] TIDAL web metadata extension loaded");

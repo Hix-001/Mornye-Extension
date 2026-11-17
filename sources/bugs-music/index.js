@@ -5,6 +5,7 @@ var TOP100_CACHE_TIME = 0;
 var FEED_CACHE = {};
 var TRACK_CACHE = {};
 var ALBUM_CACHE = {};
+var CHART_CACHE = {};
 var CACHE_TTL_MS = 5 * 60 * 1000;
 var DURATION_LOOKUP_LIMIT = 50;
 var DURATION_LOOKUP_BUDGET_MS = 10 * 1000;
@@ -21,6 +22,7 @@ function cleanup() {
   FEED_CACHE = {};
   TRACK_CACHE = {};
   ALBUM_CACHE = {};
+  CHART_CACHE = {};
   return {
     success: true
   };
@@ -518,6 +520,108 @@ function enrichTrack(track) {
   return result;
 }
 
+var RELATED_SEED_LIMIT = 5;
+var RELATED_TITLE_MIN = 0.8;
+var RELATED_ARTIST_MIN = 0.6;
+
+function matchKey(value) {
+  return String(value || "").toLowerCase().replace(/[^0-9a-zÀ-ɏ぀-ヿ㄰-㆏一-鿿가-힯]+/g, "");
+}
+
+function baseTitle(value) {
+  return String(value || "").replace(/\s*[\(\[][^\)\]]*[\)\]]/g, "").trim() || String(value || "");
+}
+
+function similarity(a, b) {
+  var left = matchKey(a), right = matchKey(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  if (typeof matching !== "undefined" && matching && typeof matching.compareStrings === "function") {
+    return Number(matching.compareStrings(String(a), String(b))) || 0;
+  }
+  return 0;
+}
+
+// Bugs often shows a Korean name with the romanized one in parentheses, such
+// as "Hangul(Latin)", so containment of either form also counts as a match.
+function artistMatches(seedArtists, artists) {
+  var seed = String(seedArtists || "").split(/\s*(?:,|&|\/|\bfeat\.?|\bft\.?)\s*/i)[0];
+  var key = matchKey(seed), other = matchKey(artists);
+  if (!key || !other) return false;
+  if (other.indexOf(key) >= 0 || key.indexOf(other) >= 0) return true;
+  return similarity(seed, artists) >= RELATED_ARTIST_MIN;
+}
+
+function resolveRelatedSeed(seed) {
+  var name = cleanText(seed.name), artists = cleanText(seed.artists);
+  if (!name || !artists) return "";
+  var best = null, bestScore = 0;
+  searchTracks(name + " " + artists).forEach(function(track) {
+    if (!artistMatches(artists, track.artists)) return;
+    var score = Math.max(similarity(name, track.name), similarity(baseTitle(name), baseTitle(track.name)));
+    if (score > bestScore) {
+      best = track;
+      bestScore = score;
+    }
+  });
+  return best && bestScore >= RELATED_TITLE_MIN ? best.id : "";
+}
+
+// The track page fills its "함께 들으면 좋은 곡" section from this fragment.
+function similarTracks(id) {
+  var html = fetchHtml(BASE_URL + "/track/ajax/similarTrack?trackId=" + id + "&page=1&decorator=blank");
+  return parseTracks(html).map(makeTrackResult);
+}
+
+function getRelatedTracks(seeds, options) {
+  var limit = Math.floor(Number(options && options.limit) || 25);
+  limit = Math.max(1, Math.min(50, limit));
+  var list = Array.isArray(seeds) ? seeds.slice(0, 10) : [];
+  var excluded = {}, seedIsrcs = {};
+  list.forEach(function(seed) {
+    if (!seed) return;
+    var isrc = String(seed.isrc || "").trim().toUpperCase();
+    if (isrc) seedIsrcs[isrc] = true;
+    if (seed.provider_id === PROVIDER_ID && seed.id) excluded[String(seed.id).replace(/^bugs:track:/, "")] = true;
+  });
+
+  var groups = [], failures = 0, successes = 0, lastError = null;
+  list.slice(0, RELATED_SEED_LIMIT).forEach(function(seed) {
+    if (!seed) return;
+    try {
+      var id = seed.provider_id === PROVIDER_ID && seed.id ? normalizeId(seed.id, "track") : resolveRelatedSeed(seed);
+      if (!id) {
+        successes++;
+        return;
+      }
+      excluded[id] = true;
+      groups.push(similarTracks(id));
+      successes++;
+    } catch (error) {
+      failures++;
+      lastError = error;
+      if (typeof log !== "undefined") log.warn("Bugs related tracks failed for a seed: " + String(error.message || error));
+    }
+  });
+  if (!successes && failures) throw lastError || new Error("Bugs related tracks are unavailable");
+
+  var results = [], seen = {};
+  for (var index = 0; results.length < limit; index++) {
+    var remaining = false;
+    for (var g = 0; g < groups.length && results.length < limit; g++) {
+      var track = groups[g][index];
+      if (!track) continue;
+      remaining = true;
+      var isrc = String(track.isrc || "").toUpperCase();
+      if (!track.id || excluded[track.id] || seen[track.id] || (isrc && seedIsrcs[isrc])) continue;
+      seen[track.id] = true;
+      results.push(track);
+    }
+    if (!remaining) break;
+  }
+  return results;
+}
+
 function customSearch(query, options) {
   var tracks = searchTracks(query);
   var limit = Number(options && typeof options === "object" ? options.limit : options);
@@ -526,6 +630,9 @@ function customSearch(query, options) {
 
 function getAlbum(albumId) {
   var id = String(albumId || "").replace("bugs:album:", "").trim();
+  var pd = id.match(/^pd-(\d+)$/);
+  if (pd) return musicPdAlbum(pd[1]);
+  if (id !== "top100" && bugsChartDefinition(id)) return bugsChartAlbum(id);
 
   // TOP100은 벅스에 실제 앨범 ID가 없는 가상 앨범이므로
   // 홈피드에서 보관한 100곡을 그대로 앨범 객체로 반환한다.
@@ -616,6 +723,12 @@ function getArtist(artistId) {
 }
 
 function handleUrl(url) {
+  var pd = String(url || "").match(/^https?:\/\/music\.bugs\.co\.kr\/musicpd\/albumview\/(\d+)\/?(?:[?#].*)?$/i);
+  if (pd) {
+    var album = getAlbum("pd-" + pd[1]);
+    return { type: "album", id: album.id, album: album, name: album.name,
+      cover_url: album.cover_url, tracks: album.tracks };
+  }
   var match = String(url || "").match(/^https?:\/\/(?:music|m)\.bugs\.co\.kr\/(track|album|artist)\/(\d+)\/?(?:[?#].*)?$/i);
   if (!match) throw new Error("Unsupported Bugs URL");
   var type = match[1].toLowerCase(), id = match[2];
@@ -640,6 +753,81 @@ function firstAvailableTop100() {
   return [];
 }
 
+var BUGS_PERIOD_CHARTS = [
+  { id: "top100-realtime", title: "벅스 TOP 100 실시간", path: "/chart/track/realtime/total" },
+  { id: "top100-day", title: "벅스 TOP 100 일간", path: "/chart/track/day/total" },
+  { id: "top100-week", title: "벅스 TOP 100 주간", path: "/chart/track/week/total" }
+];
+var BUGS_GENRE_CHARTS = [
+  ["kpop-ballad", "kpop/ballad", "발라드"], ["kpop-dance", "kpop/dance", "댄스/팝"],
+  ["kpop-rnh", "kpop/rnh", "랩/힙합"], ["kpop-ost", "kpop/ost", "OST"],
+  ["kpop-idol", "kpop/idol", "아이돌"], ["kpop-rns", "kpop/rns", "알앤비/소울"],
+  ["kpop-indie", "kpop/indie", "인디"], ["kpop-rock", "kpop/rock", "락/메탈"],
+  ["kpop-folk", "kpop/folk", "포크/어쿠스틱"], ["kpop-elec", "kpop/elec", "일렉트로닉"],
+  ["kpop-jazz", "kpop/jazz", "재즈"], ["kpop-adultkpop", "kpop/adultkpop", "성인가요"],
+  ["pop-pop", "pop/pop", "해외 팝"], ["pop-hiphop", "pop/hiphop", "해외 랩/힙합"],
+  ["pop-rnb", "pop/rnb", "해외 알앤비/소울"], ["etc-njpop", "etc/njpop", "J-POP"],
+  ["etc-nnewage", "etc/nnewage", "뉴에이지"]
+];
+
+function bugsChartDefinition(id) {
+  for (var i = 0; i < BUGS_PERIOD_CHARTS.length; i++) {
+    if (BUGS_PERIOD_CHARTS[i].id === id) return BUGS_PERIOD_CHARTS[i];
+  }
+  for (var j = 0; j < BUGS_GENRE_CHARTS.length; j++) {
+    var genre = BUGS_GENRE_CHARTS[j];
+    if (id === "genre-" + genre[0]) return { id: id, title: "벅스 " + genre[2] + " 일간",
+      path: "/genre/chart/" + genre[1] + "/total/day" };
+  }
+  return null;
+}
+
+function bugsChartAlbum(id) {
+  var definition = bugsChartDefinition(id);
+  if (!definition) throw new Error("Unknown Bugs chart: " + id);
+  var cached = CHART_CACHE[id];
+  if (cached && Date.now() - cached.time < CACHE_TTL_MS) return cached.value;
+  var tracks = safeTracks(BASE_URL + definition.path).slice(0, 100);
+  if (!tracks.length) throw new Error("Bugs chart is unavailable: " + id);
+  var album = makeVirtualAlbum(id, definition.title, tracks, tracks[0].cover_url);
+  cacheStore(CHART_CACHE, id, { time: Date.now(), value: album });
+  return album;
+}
+
+function musicPdAlbums() {
+  var html = fetchHtml(BASE_URL + "/musicpd");
+  var figures = html.match(/<figure[^>]*class=["'][^"']*musicPDAlbumInfo[^"']*["'][^>]*>[\s\S]*?<\/figure>/gi) || [];
+  var items = [], seen = {};
+  for (var i = 0; i < figures.length && items.length < 30; i++) {
+    var id = firstMatch(figures[i], [/\/musicpd\/albumview\/(\d+)/i]);
+    var name = firstMatch(figures[i], [/<img[^>]*alt=["']([^"']+?)\s*대표이미지["']/i]);
+    if (!id || !name || seen[id]) continue;
+    seen[id] = true;
+    var cover = normalizeCoverUrl(firstMatch(figures[i], [/<img[^>]*src=["']([^"']+)["']/i]));
+    items.push({ id: "pd-" + id, uri: "bugs:album:pd-" + id, type: "album", item_type: "album",
+      name: name, artists: "벅스 뮤직PD", album_type: "compilation", total_tracks: 0,
+      cover_url: cover, images: cover, provider_id: PROVIDER_ID, tracks: [] });
+  }
+  return items;
+}
+
+function musicPdAlbum(id) {
+  var key = "pd-" + id, cached = ALBUM_CACHE[key];
+  if (cached && Date.now() - cached.time < CACHE_TTL_MS) return cached.value;
+  var html = fetchHtml(BASE_URL + "/musicpd/albumview/" + id);
+  var actual = firstMatch(html, [/<meta[^>]*property=["']og:url["'][^>]*content=["'][^"']*\/musicpd\/albumview\/(\d+)(?:[/?#"'])/i]);
+  if (actual && actual !== id) throw new Error("Bugs returned another Music PD album");
+  var primary = html.match(/<table[^>]*class=["'][^"']*\btrackList\b[^"']*["'][^>]*>[\s\S]*?<\/table>/i);
+  var tracks = parseTracks(primary ? primary[0] : "");
+  if (!tracks.length) throw new Error("Bugs Music PD track list is unavailable: " + id);
+  var name = firstMatch(html, [/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i]) || pageTitle(html);
+  if (!name) throw new Error("Bugs Music PD title is unavailable: " + id);
+  var cover = normalizeCoverUrl(firstMatch(html, [/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i]));
+  var album = makeVirtualAlbum(key, name.replace(/\s+\/\s+[^\/]*$/, ""), tracks, cover);
+  cacheStore(ALBUM_CACHE, key, { time: Date.now(), value: album });
+  return album;
+}
+
 function getHomeFeed() {
   if (FEED_CACHE.feed && Date.now() - FEED_CACHE.time < CACHE_TTL_MS) return FEED_CACHE.feed;
   function firstAvailable(urls) {
@@ -662,6 +850,15 @@ function getHomeFeed() {
       title: "벅스 TOP 100",
       items: [makeVirtualAlbum("top100", "Bugs (벅스) TOP 100", top100, top100[0].cover_url)]
     });
+  }
+  for (var period = 1; period < BUGS_PERIOD_CHARTS.length; period++) {
+    try {
+      var chart = bugsChartAlbum(BUGS_PERIOD_CHARTS[period].id);
+      if (top100.length) sections[0].items.push(chart);
+      else sections.push({ uri: "bugs:" + chart.id, title: chart.name, items: [chart] });
+    } catch (error) {
+      log.warn("Bugs optional chart unavailable: " + BUGS_PERIOD_CHARTS[period].id);
+    }
   }
 
   // /newest/track는 전체 국가라 외국곡이 섞일 수 있으므로 국내 최신곡 경로를 사용한다.
@@ -723,6 +920,12 @@ function getHomeFeed() {
     if (gTracks.length) sections.push(makeSection("bugs:genre:" + extraGenres[gi][0].replace("/", "-"), extraGenres[gi][1], gTracks.slice(0, 30)));
   }
 
+  try {
+    var pdItems = musicPdAlbums();
+    if (pdItems.length) sections.push({ uri: "bugs:musicpd", title: "뮤직PD 앨범", items: pdItems });
+  } catch (error) {
+    log.warn("Bugs Music PD albums unavailable");
+  }
   if (!sections.length) throw new Error("Bugs home feed is unavailable");
   var feed = { success: true, greeting: "Bugs Music", sections: sections };
   FEED_CACHE = { time: Date.now(), feed: feed };
@@ -739,5 +942,6 @@ registerExtension({
   getAlbum: getAlbum,
   getArtist: getArtist,
   handleUrl: handleUrl,
-  getHomeFeed: getHomeFeed
+  getHomeFeed: getHomeFeed,
+  getRelatedTracks: getRelatedTracks
 });

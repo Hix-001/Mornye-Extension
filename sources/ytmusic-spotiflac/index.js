@@ -329,7 +329,33 @@ function getYt1dConfig() {
 
 // Direct clients follow yt-dlp's current client contexts. Android VR 1.65.10
 // has returned 403 for all formats since August 2026, so it is not a fallback.
+// visionOS goes first: its formats carry plain URLs, so it needs neither the
+// player script nor the wait for an ad that the TV client has.
 var INNERTUBE_CLIENTS = [
+  {
+    name: "visionos",
+    clientHeaderName: "101",
+    requiresGvsPoToken: false,
+    requiresJsPlayer: false,
+    body: {
+      context: {
+        client: {
+          clientName: "VISIONOS",
+          clientVersion: "1.02",
+          deviceMake: "Apple",
+          deviceModel: "RealityDevice17,1",
+          hl: "en",
+          gl: "US",
+          timeZone: "UTC",
+          utcOffsetMinutes: 0,
+          osName: "visionOS",
+          osVersion: "26.5.23O471",
+        },
+      },
+    },
+    ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+    key: CONFIG.innerTubeApiKey,
+  },
   {
     name: "tv_samsung",
     clientHeaderName: "7",
@@ -357,7 +383,8 @@ var INNERTUBE_CLIENTS = [
   {
     name: "web_embedded",
     clientHeaderName: "56",
-    requiresGvsPoToken: false,
+    // Its media URLs need a token since November 2026, as for the web client.
+    requiresGvsPoToken: true,
     requiresJsPlayer: true,
     body: {
       context: {
@@ -771,6 +798,17 @@ function extractYouTubePlayerURL(text) {
   if (!match) return "";
   var playerURL = String(match[1] || match[0] || "").replace(/\\\//g, "/");
   if (!playerURL) return "";
+  // A page can name any build of its player (es6, tce, a translated one).
+  // They sign alike, and the plain build is the one yt-dlp solves, so the
+  // same player id is always read in that build.
+  var playerId = playerURL.match(/\/s\/player\/([A-Za-z0-9_-]+)\//);
+  if (playerId) {
+    return (
+      "https://www.youtube.com/s/player/" +
+      playerId[1] +
+      "/player_ias.vflset/en_US/base.js"
+    );
+  }
   if (playerURL.indexOf("//") === 0) return "https:" + playerURL;
   if (playerURL.charAt(0) === "/") return "https://www.youtube.com" + playerURL;
   return /^https?:\/\//i.test(playerURL) ? playerURL : "";
@@ -856,32 +894,44 @@ function loadYouTubePlayerJS(playerUrl) {
   return js;
 }
 
-function findYouTubeURLTransformFunction(playerJS) {
+// Names of the player functions that may build a media URL from
+// (url, key, value). The player marks that function with a plain
+// `x.set("alr","yes")` statement, as yt-dlp's solver looks for. The same call
+// also appears guarded (`x.get("alr")||x.set(...)`), in async functions and
+// in class bodies, and the first one in the file is no longer the right one,
+// so every plain statement names a candidate and the solver tries them all.
+// The player starts each top-level statement on its own line; a function body
+// can continue over further lines, so the owner is the nearest earlier line
+// that starts a function.
+function findYouTubeURLTransformFunctions(playerJS) {
   var text = String(playerJS || "");
-  var marker = /\.set\(\s*["']alr["']\s*,\s*["']yes["']\s*\)/g.exec(text);
-  if (!marker) return "";
-
-  var prefix = text.substring(Math.max(0, marker.index - 12000), marker.index);
-  var patterns = [
-    /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\([^)]*\)\s*\{/g,
-    /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g,
-    /([A-Za-z_$][\w$]*)\s*=\s*function\s*\([^)]*\)\s*\{/g,
-  ];
-  var best = "";
-  for (var pi = 0; pi < patterns.length; pi++) {
-    var pattern = patterns[pi];
-    var match;
-    while ((match = pattern.exec(prefix))) {
-      if (match[1]) best = match[1];
+  var marker =
+    /[;{]\s*[A-Za-z_$][\w$]*\.set\(\s*["']alr["']\s*,\s*["']yes["']\s*\)/g;
+  var definition =
+    /^(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*(async\s+)?function\s*\(|^(async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/;
+  var names = [];
+  var match;
+  while ((match = marker.exec(text))) {
+    var lineStart = text.lastIndexOf("\n", match.index) + 1;
+    for (var lines = 0; lines < 40; lines++) {
+      var owner = definition.exec(text.substring(lineStart, lineStart + 200));
+      if (owner) {
+        var name = owner[1] || owner[4];
+        var isAsync = owner[2] || owner[3];
+        if (name && !isAsync && names.indexOf(name) < 0) names.push(name);
+        break;
+      }
+      if (lineStart === 0) break;
+      lineStart = text.lastIndexOf("\n", lineStart - 2) + 1;
     }
   }
-  return best;
+  return names;
 }
 
 function buildYouTubeChallengeSolver(playerJS) {
   var text = String(playerJS || "");
-  var transformFn = findYouTubeURLTransformFunction(text);
-  if (!transformFn) return null;
+  var transformFns = findYouTubeURLTransformFunctions(text);
+  if (!transformFns.length) return null;
 
   var marker = ";})(_yt_player);";
   var markerIndex = text.lastIndexOf(marker);
@@ -891,19 +941,33 @@ function buildYouTubeChallengeSolver(playerJS) {
   }
   if (markerIndex < 0) return null;
 
+  // A wrong candidate throws or returns something that is not a URL object;
+  // the first candidate that answers everything asked wins.
+  var candidates = [];
+  for (var ti = 0; ti < transformFns.length; ti++) {
+    candidates.push(
+      "function(a,b,c){return " + transformFns[ti] + "(a,b,c)}",
+    );
+  }
   var injection =
     ';(function(){var root=typeof globalThis!=="undefined"?globalThis:this;' +
-    "root.__mornyeYtChallengeSolver=function(sig,n){var result={};" +
-    "var url=" +
-    transformFn +
-    '("https://www.youtube.com/watch?v=yt-dlp-wins","s",sig?encodeURIComponent(sig):void 0);' +
+    "var fns=[" +
+    candidates.join(",") +
+    "];" +
+    "root.__mornyeYtChallengeSolver=function(sig,n){var last;" +
+    "for(var f=0;f<fns.length;f++){try{var result={};" +
+    'var url=fns[f]("https://www.youtube.com/watch?v=yt-dlp-wins","s",sig?encodeURIComponent(sig):void 0);' +
+    'if(!url||typeof url.set!=="function"||typeof url.get!=="function")continue;' +
     'if(n){url.set("n",n);var proto=Object.getPrototypeOf(url);var names=Object.getOwnPropertyNames(proto);' +
     "for(var i=0;i<names.length;i++){var name=names[i];" +
     'if(name==="constructor"||name==="set"||name==="get"||name==="clone")continue;' +
     'if(typeof url[name]!=="function")continue;' +
     "try{url[name](url);break}catch(e){try{url[name]();break}catch(e2){}}}}" +
     'if(sig)result.sig=decodeURIComponent(url.get("s")||url.get("sig")||url.get("signature")||"");' +
-    'if(n)result.n=url.get("n")||"";return result};})();';
+    'if(n)result.n=url.get("n")||"";' +
+    "if((sig&&!result.sig)||(n&&!result.n))continue;" +
+    "return result}catch(e){last=e}}" +
+    "if(last)throw last;return {}};})();";
 
   var root = getGlobalRoot();
   var previous = {};
@@ -1045,6 +1109,87 @@ function buildYouTubeFormatURL(fmt, playerUrl) {
   }
 }
 
+var MAX_PREROLL_WAIT_MS = 90 * 1000;
+
+function instreamAdOf(renderingContent) {
+  return (renderingContent && renderingContent.instreamVideoAdRenderer) || null;
+}
+
+// YouTube answers a media URL with HTTP 403 until the ad placed before the
+// song could have been watched or skipped, counted from the player request.
+// The wait is read from the player response the way yt-dlp reads it: every
+// ad that plays before the content adds its skip time, or its whole length
+// when it cannot be skipped.
+function prerollWaitMs(playerResponse) {
+  var response = playerResponse || {};
+  var ads = [];
+  var placements = response.adPlacements || [];
+  for (var pi = 0; pi < placements.length; pi++) {
+    var placement = placements[pi] && placements[pi].adPlacementRenderer;
+    var config = placement && placement.config;
+    var kind = config && config.adPlacementConfig && config.adPlacementConfig.kind;
+    if (kind !== "AD_PLACEMENT_KIND_START") continue;
+    var placed = instreamAdOf(placement.renderer);
+    if (placed) ads.push(placed);
+  }
+  var slots = response.adSlots || [];
+  for (var si = 0; si < slots.length; si++) {
+    var slot = slots[si] && slots[si].adSlotRenderer;
+    var metadata = slot && slot.adSlotMetadata;
+    if (!metadata || metadata.triggerEvent !== "SLOT_TRIGGER_EVENT_BEFORE_CONTENT")
+      continue;
+    var layout =
+      slot.fulfillmentContent &&
+      slot.fulfillmentContent.fulfilledLayout &&
+      slot.fulfillmentContent.fulfilledLayout.playerBytesAdLayoutRenderer;
+    var content = layout && layout.renderingContent;
+    if (!content) continue;
+    var single = instreamAdOf(content);
+    if (single) ads.push(single);
+    var sequence =
+      content.playerBytesSequentialLayoutRenderer &&
+      content.playerBytesSequentialLayoutRenderer.sequentialLayouts;
+    for (var li = 0; li < (sequence || []).length; li++) {
+      var inner = sequence[li] && sequence[li].playerBytesAdLayoutRenderer;
+      var sequenced = instreamAdOf(inner && inner.renderingContent);
+      if (sequenced) ads.push(sequenced);
+    }
+  }
+
+  var waitMs = 0;
+  for (var ai = 0; ai < ads.length; ai++) {
+    var skipMs = Number(ads[ai].skipOffsetMilliseconds);
+    if (isFinite(skipMs) && ads[ai].skipOffsetMilliseconds != null) {
+      waitMs += Math.max(0, skipMs);
+      continue;
+    }
+    var seconds = Number(
+      parseQueryString(String(ads[ai].playerVars || "")).length_seconds,
+    );
+    if (isFinite(seconds) && seconds > 0) waitMs += seconds * 1000;
+  }
+  // One second over, as the server counts from when it answered.
+  return waitMs > 0 ? Math.min(waitMs + 1000, MAX_PREROLL_WAIT_MS) : 0;
+}
+
+// False when the download was cancelled while waiting.
+function waitUntilAvailable(candidate) {
+  var remaining = Number((candidate && candidate.availableAt) || 0) - now();
+  if (remaining <= 0) return true;
+  L(
+    "info",
+    "[YTMusic] Waiting " + Math.ceil(remaining / 1000) + "s for the ad before",
+    candidate.clientName,
+  );
+  if (typeof utils === "undefined" || !utils || typeof utils.sleep !== "function")
+    return true;
+  while (remaining > 0) {
+    if (utils.sleep(Math.min(remaining, 250)) === false) return false;
+    remaining = candidate.availableAt - now();
+  }
+  return true;
+}
+
 function _tryInnerTubeClient(videoID, clientConfig, pageInfo, options) {
   options = options || {};
   pageInfo = pageInfo || {};
@@ -1122,6 +1267,7 @@ function _tryInnerTubeClient(videoID, clientConfig, pageInfo, options) {
   if (!sd) return { error: "no streamingData" };
 
   var formats = (sd.formats || []).concat(sd.adaptiveFormats || []);
+  var availableAt = now() + prerollWaitMs(data);
   var gvsPoToken = getGvsPoToken(
     videoID,
     clientConfig,
@@ -1147,6 +1293,7 @@ function _tryInnerTubeClient(videoID, clientConfig, pageInfo, options) {
       contentLength: bestAudio.contentLength || "",
       bitrate: bestAudio.averageBitrate || bestAudio.bitrate || 0,
       clientName: clientConfig.name,
+      availableAt: availableAt,
       needsGvsPoToken:
         clientConfig.requiresGvsPoToken && isGvsPoTokenRequiredFormat(bestAudio),
       poTokenUsed: !!gvsPoToken,
@@ -1668,6 +1815,9 @@ function isDownloadAuthFailure(result) {
 }
 
 function attemptDirectCandidateDownload(candidate, outputPath, youtubeURL) {
+  if (!waitUntilAvailable(candidate)) {
+    return { path: outputPath, result: { success: false, error: "cancelled" } };
+  }
   return downloadAudioURL(
     candidate.url,
     outputPath,
@@ -2280,6 +2430,9 @@ function parseItemExtended(info) {
     var durationText = "";
     if (c.lengthText && c.lengthText.simpleText)
       durationText = c.lengthText.simpleText;
+    // Watch-next queue rows (playlistPanelVideoRenderer) carry runs instead.
+    if (!durationText && c.lengthText && c.lengthText.runs)
+      durationText = runsText(c.lengthText.runs, "");
     if (
       !durationText &&
       c.thumbnailOverlays &&
@@ -3367,6 +3520,259 @@ function customSearchSync(query, options) {
   }
 }
 
+// ---- Related tracks (watch-next radio queue) ----
+
+var RELATED_MAX_SEEDS = 5;
+var RELATED_DURATION_TOLERANCE_MS = 15000;
+
+function stripTrackTitleAnnotations(value) {
+  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, function(annotation) {
+    if (/^[(\[]\s*with\b/i.test(annotation) &&
+        /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/i.test(annotation)) {
+      return annotation;
+    }
+    return " ";
+  });
+}
+
+function downloadMatchValue(value) {
+  return String(value || "").toLowerCase().replace(/&/g, " and ")
+    .replace(/[^a-z0-9\u0080-\uffff]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function downloadRecordingMatches(trackName, artistName, durationMs, candidate) {
+  var titleKey = downloadMatchValue(stripTrackTitleAnnotations(trackName));
+  if (!titleKey || titleKey !== downloadMatchValue(stripTrackTitleAnnotations(candidate.name || candidate.title))) return false;
+  if (artistName) {
+    var artistText = " " + downloadMatchValue(candidate.artists) + " ";
+    var artists = String(artistName).split(/[,;&]|\s+(?:and|feat\.?|ft\.?|featuring|x)\s+/i);
+    if (!artists.some(function(artist) {
+      var key = downloadMatchValue(artist);
+      return key && artistText.indexOf(" " + key + " ") >= 0;
+    })) return false;
+  }
+  var candidateDuration = Number(candidate.duration_ms || 0);
+  return !(durationMs > 0 && candidateDuration > 0 && Math.abs(durationMs - candidateDuration) > 15000);
+}
+
+function relatedTitleKey(value) {
+  return metadataMatchValue(
+    String(value || "").replace(/\s*[\(\[][^\)\]]*[\)\]]/g, " "),
+  );
+}
+
+function relatedArtistKeys(value) {
+  var parts = Array.isArray(value)
+    ? value
+    : String(value || "").split(
+        /\s*,\s*|\s*;\s*|\s+&\s+|\s+and\s+|\s+feat\.?\s+|\s+ft\.?\s+|\s+x\s+/i,
+      );
+  var keys = [];
+  for (var i = 0; i < parts.length; i++) {
+    var key = metadataMatchValue(parts[i]);
+    if (key && keys.indexOf(key) < 0) keys.push(key);
+  }
+  return keys;
+}
+
+function isConfidentSeedMatch(seed, candidate) {
+  if (!seed || !candidate || !candidate.id) return false;
+  var seedTitle = relatedTitleKey(seed.name);
+  var candidateTitle = relatedTitleKey(candidate.name);
+  if (!seedTitle || !candidateTitle) return false;
+  if (
+    seedTitle !== candidateTitle &&
+    candidateTitle.indexOf(seedTitle + " ") !== 0 &&
+    seedTitle.indexOf(candidateTitle + " ") !== 0
+  )
+    return false;
+
+  var seedArtists = relatedArtistKeys(seed.artists);
+  var candidateArtists = relatedArtistKeys(candidate.artists);
+  var candidateArtistText = " " + metadataMatchValue(candidate.artists) + " ";
+  var artistOk = false;
+  for (var i = 0; i < seedArtists.length && !artistOk; i++) {
+    if (
+      candidateArtists.indexOf(seedArtists[i]) >= 0 ||
+      candidateArtistText.indexOf(" " + seedArtists[i] + " ") >= 0
+    )
+      artistOk = true;
+  }
+  if (!artistOk) return false;
+
+  var seedDuration = Number(seed.duration_ms) || 0;
+  var candidateDuration = Number(candidate.duration_ms) || 0;
+  if (
+    seedDuration > 0 &&
+    candidateDuration > 0 &&
+    Math.abs(seedDuration - candidateDuration) > RELATED_DURATION_TOLERANCE_MS
+  )
+    return false;
+  return true;
+}
+
+function resolveRelatedSeed(seed) {
+  var artists = Array.isArray(seed.artists)
+    ? seed.artists.join(", ")
+    : String(seed.artists || "");
+  var query = (artists ? artists + " " : "") + String(seed.name || "");
+  if (!query.trim()) return null;
+  var results = customSearchSync(query.trim(), { filter: "tracks" });
+  for (var i = 0; i < results.length; i++) {
+    var candidate = results[i];
+    if (candidate && candidate.item_type === "track") {
+      if (isConfidentSeedMatch(seed, candidate)) return candidate.id;
+    }
+  }
+  return null;
+}
+
+function relatedVideoType(node) {
+  var renderer = node && node.playlistPanelVideoRenderer;
+  var endpoint = renderer && renderer.navigationEndpoint;
+  var config =
+    endpoint &&
+    endpoint.watchEndpoint &&
+    endpoint.watchEndpoint.watchEndpointMusicSupportedConfigs &&
+    endpoint.watchEndpoint.watchEndpointMusicSupportedConfigs
+      .watchEndpointMusicConfig;
+  return (config && config.musicVideoType) || "";
+}
+
+// Fetches the YouTube Music radio ("RDAMVM" + videoId) queue for one song.
+// Returns sanitized tracks in the customSearch shape. Throws on HTTP errors.
+function fetchRelatedForVideo(videoId) {
+  var key = "yt:related:" + videoId;
+  var cached = cacheGet(key);
+  if (cached) return cached;
+
+  var res = fetch("https://music.youtube.com/youtubei/v1/next?alt=json", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible)",
+      "x-youtube-client-name": "WEB_REMIX",
+      "x-youtube-client-version": CONFIG.clientVersion,
+    },
+    body: JSON.stringify({
+      context: {
+        client: {
+          clientName: "WEB_REMIX",
+          clientVersion: CONFIG.clientVersion,
+        },
+      },
+      videoId: videoId,
+      playlistId: "RDAMVM" + videoId,
+      isAudioOnly: true,
+    }),
+  });
+  if (!res || !res.ok) {
+    throw new Error(
+      "YouTube Music related request failed: " +
+        (res ? res.status : "no response"),
+    );
+  }
+  var data = res.json();
+  var panel =
+    data && data.contents
+      ? findFirstRenderer(data.contents, "playlistPanelRenderer")
+      : null;
+  var rows = panel && Array.isArray(panel.contents) ? panel.contents : [];
+
+  // Song seeds return songs; video seeds return music videos. Prefer songs
+  // and only keep other video types when the queue has no song at all.
+  var songs = [];
+  var others = [];
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row || !row.playlistPanelVideoRenderer) continue;
+    var type = relatedVideoType(row);
+    if (!type || type === "MUSIC_VIDEO_TYPE_ATV") songs.push(row);
+    else others.push(row);
+  }
+  var picked = songs.length > 0 ? songs : others;
+  var tracks = [];
+  for (var j = 0; j < picked.length; j++) {
+    var sanitized = sanitizeTrackBeforeReturn(parseItemExtended(picked[j]));
+    if (sanitized) tracks.push(stripUrlLikeFields(sanitized));
+  }
+  cacheSet(key, tracks);
+  return tracks;
+}
+
+function getRelatedTracks(seeds, options) {
+  var limit = Number(options && options.limit) || 25;
+  limit = Math.max(1, Math.min(50, Math.floor(limit)));
+  var list = Array.isArray(seeds) ? seeds.slice(0, 10) : [];
+
+  var excludedIds = {};
+  var excludedIsrcs = {};
+  var seedIds = [];
+  var attempted = 0;
+  for (var i = 0; i < list.length; i++) {
+    var seed = list[i];
+    if (!seed) continue;
+    var isrc = String(seed.isrc || "")
+      .trim()
+      .toUpperCase();
+    if (isrc) excludedIsrcs[isrc] = true;
+    var ownId =
+      seed.provider_id === "ytmusic-spotiflac"
+        ? String(seed.id || "").trim()
+        : "";
+    if (ownId) excludedIds[ownId] = true;
+    if (attempted >= RELATED_MAX_SEEDS) continue;
+    attempted++;
+    var videoId = ownId;
+    if (!videoId) {
+      try {
+        videoId = resolveRelatedSeed(seed) || "";
+      } catch (e) {
+        L("warn", "getRelatedTracks seed resolution failed", String(e));
+        videoId = "";
+      }
+    }
+    if (!videoId || seedIds.indexOf(videoId) >= 0) continue;
+    excludedIds[videoId] = true;
+    seedIds.push(videoId);
+  }
+
+  var lists = [];
+  var failures = 0;
+  for (var s = 0; s < seedIds.length; s++) {
+    try {
+      lists.push(fetchRelatedForVideo(seedIds[s]));
+    } catch (e) {
+      failures++;
+      L("warn", "getRelatedTracks related request failed", String(e));
+    }
+  }
+  if (lists.length === 0 && failures > 0) {
+    throw new Error("YouTube Music related tracks unavailable");
+  }
+
+  var out = [];
+  var seen = {};
+  var longest = 0;
+  for (var l = 0; l < lists.length; l++) {
+    if (lists[l].length > longest) longest = lists[l].length;
+  }
+  for (var idx = 0; idx < longest && out.length < limit; idx++) {
+    for (var li = 0; li < lists.length && out.length < limit; li++) {
+      var track = lists[li][idx];
+      if (!track || !track.id || seen[track.id] || excludedIds[track.id])
+        continue;
+      var trackIsrc = String(track.isrc || "")
+        .trim()
+        .toUpperCase();
+      if (trackIsrc && excludedIsrcs[trackIsrc]) continue;
+      seen[track.id] = true;
+      out.push(track);
+    }
+  }
+  return out;
+}
+
 function validateTrackForDownload(track) {
   if (!track || typeof track !== "object")
     return { ok: false, reason: "invalid_track" };
@@ -3423,7 +3829,11 @@ function extractVideoId(url) {
     var u = new URL(url);
     if (u.searchParams.has("v")) return u.searchParams.get("v");
     if (u.hostname === "youtu.be") return u.pathname.slice(1).split("/")[0];
-    return null;
+    // Shorts, live and embedded links keep the id in the path.
+    var inPath = String(u.pathname || "").match(
+      /^\/(?:shorts|live|embed|v)\/([A-Za-z0-9_-]{6,})/,
+    );
+    return inPath ? inPath[1] : null;
   } catch (e) {
     return null;
   }
@@ -5701,6 +6111,7 @@ registerExtension({
   getPlaylist: getPlaylist,
   getArtist: getArtist,
   getHomeFeed: getHomeFeed,
+  getRelatedTracks: getRelatedTracks,
   enrichTrack: enrichTrack,
   validateTrackForDownload: validateTrackForDownload,
   finalGuardBeforeNative: finalGuardBeforeNative,
@@ -5714,7 +6125,9 @@ registerExtension({
     L("info", "[YTMusic] checkAvailability:", isrc, trackName, artistName);
 
     var spotifyId = options && options.spotify_id ? options.spotify_id : null;
-    if (spotifyId && /^[A-Za-z0-9_-]{11}$/.test(spotifyId)) {
+    var source = String(options && options.track && options.track.provider_id || "").trim().toLowerCase();
+    var directTrack = source === "ytmusic-spotiflac" || (!source && !trackName && !artistName);
+    if (directTrack && spotifyId && /^[A-Za-z0-9_-]{11}$/.test(spotifyId)) {
       L("info", "[YTMusic] spotify_id looks like a video ID:", spotifyId);
       return { available: true, track_id: spotifyId };
     }
@@ -5725,31 +6138,29 @@ registerExtension({
     }
 
     try {
-      var results = performSearchSync(query, YT_SEARCH_PARAMS.tracks);
-      if (!results || results.length === 0) {
-        L("info", "[YTMusic] No search results for:", query);
-        return { available: false, reason: "not_found" };
+      var queries = [query.trim()];
+      var strippedTitle = stripTrackTitleAnnotations(trackName).replace(/\s+/g, " ").trim();
+      if (strippedTitle && strippedTitle !== String(trackName || "").trim()) {
+        var strippedQuery = ((artistName ? artistName + " " : "") + strippedTitle).trim();
+        if (queries.indexOf(strippedQuery) < 0) queries.push(strippedQuery);
       }
-
-      for (var i = 0; i < results.length; i++) {
-        var item = results[i];
-        if (
-          item &&
-          item.id &&
-          (item.item_type === "track" || item.type === "track")
-        ) {
-          L("info", "[YTMusic] Found track:", item.id, item.name || item.title);
-          return { available: true, track_id: item.id };
+      var durationMs = Number(options && (options.duration_ms || options.track && options.track.duration_ms) || 0);
+      for (var queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+        if (utils && typeof utils.isDownloadCancelled === "function" && utils.isDownloadCancelled()) {
+          return { available: false, reason: "download cancelled" };
+        }
+        var results = performSearchSync(queries[queryIndex], YT_SEARCH_PARAMS.tracks) || [];
+        for (var i = 0; i < results.length; i++) {
+          var item = results[i];
+          if (item && item.id && (item.item_type === "track" || item.type === "track") &&
+              downloadRecordingMatches(trackName, artistName, durationMs, item)) {
+            L("info", "[YTMusic] Found verified track:", item.id, item.name || item.title);
+            return { available: true, track_id: item.id };
+          }
         }
       }
 
-      // Fallback: use first result regardless of type
-      if (results[0] && results[0].id) {
-        L("info", "[YTMusic] Using first result as fallback:", results[0].id);
-        return { available: true, track_id: results[0].id };
-      }
-
-      return { available: false, reason: "no_video_id_in_results" };
+      return { available: false, reason: "No verified YouTube Music track match found" };
     } catch (e) {
       L("error", "[YTMusic] checkAvailability error:", String(e));
       return { available: false, reason: "search_error: " + String(e) };

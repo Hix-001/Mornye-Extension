@@ -1,5 +1,5 @@
 // Amazon Music Metadata & Download Provider for Mornye
-// v2.3.12 - Regional Home feeds with canonical catalog resolution for downloads.
+// Regional Home feeds with canonical catalog resolution for downloads.
 // Uses reverse-engineered Amazon Music web API (skill.music.a2z.com).
 
 var CONFIG = {
@@ -18,6 +18,10 @@ var CONFIG = {
   deviceModel: "WEBPLAYER",
   musicTerritory: "US"
 };
+
+// Logged so an exported log names the running package. Kept equal to
+// manifest.json by tests/amazon_session.test.cjs.
+var EXTENSION_VERSION = "2.3.19";
 
 var USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
@@ -527,7 +531,17 @@ function initSession(context) {
   _session.initialized = true;
 }
 
-function refreshSession() {
+function refreshSession(withNewCookies) {
+  // Amazon ties a session to its cookies, so a renewal that keeps them gets
+  // the same session back.
+  if (withNewCookies && typeof http !== "undefined" && http &&
+      typeof http.clearCookies === "function") {
+    try {
+      http.clearCookies();
+    } catch (e) {
+      L("warn", "[Amazon] Clearing cookies failed:", String(e));
+    }
+  }
   // Force re-fetch config.json if getting 429s
   _session.initialized = false;
   initSession();
@@ -837,12 +851,36 @@ function _doShowSearch(apiBaseURL, keyword, pageUrl, body, context) {
   }
   L("info", "[Amazon] showSearch response:", res ? res.status : "null");
   if (!res || !res.ok) return null;
+  var data;
   try {
-    return res.json();
+    data = res.json();
   } catch (e) {
     L("error", "[Amazon] showSearch JSON parse failed:", String(e));
     return null;
   }
+  if (isServiceErrorDialog(data)) {
+    L("warn", "[Amazon] showSearch returned a service error instead of results");
+    return SEARCH_SERVICE_ERROR;
+  }
+  return data;
+}
+
+// An expired session's search still answers HTTP 200, with a "Service error"
+// dialog in place of the search page. Such a search gets one retry with a new
+// session instead of showing no results.
+var SEARCH_SERVICE_ERROR = { serviceError: true };
+
+function isServiceErrorDialog(data) {
+  var methods = data && data.methods;
+  if (!methods || !methods.length) return false;
+  var dialog = false;
+  for (var i = 0; i < methods.length; i++) {
+    var template = methods[i] && methods[i].template;
+    var name = String((template && template.interface) || "");
+    if (/SearchTemplate$/.test(name)) return false;
+    if (/DialogTemplate$/.test(name)) dialog = true;
+  }
+  return dialog;
 }
 
 function callShowSearch(keyword, context, _retried) {
@@ -864,6 +902,21 @@ function callShowSearch(keyword, context, _retried) {
   });
 
   var result = _doShowSearch(CONFIG.skillBaseURL, keyword, pageUrl, body, ctx);
+  if (result === SEARCH_SERVICE_ERROR) {
+    if (!_retried) {
+      L("info", "[Amazon] showSearch service error, starting a new session and retrying...");
+      refreshSession(true);
+      sleep(CONFIG.baseBackoffMs);
+      return callShowSearch(keyword, ctx, true);
+    }
+    // Refused again with a new session: more attempts only add delay. Some
+    // regions get this for every search while album and artist links work.
+    L("warn", "[Amazon] Search refused for:", keyword);
+    var refused = new Error("amazon_search_refused");
+    refused.code = "search_refused";
+    refused.retryable = false;
+    throw refused;
+  }
   if (result) return result;
 
   if (!_retried) {
@@ -1237,7 +1290,8 @@ function parseDescriptiveRows(data) {
         track_number: i + 1,
         album_id: albumId,
         external_url: amazonTrackURL(trackId),
-        explicit: amazonItemIsExplicit(row)
+        explicit: amazonItemIsExplicit(row),
+        audio_modes: amazonTrackAudioModes(row)
       });
     }
   }
@@ -1299,7 +1353,8 @@ function parseVisualRows(data) {
         track_number: i + 1,
         album_id: albumId,
         external_url: amazonTrackURL(trackId),
-        explicit: amazonItemIsExplicit(row)
+        explicit: amazonItemIsExplicit(row),
+        audio_modes: amazonTrackAudioModes(row)
       });
     }
   }
@@ -1526,7 +1581,8 @@ function parseTrackFromResponse(data, responseStr, trackId) {
     duration: 0,
     duration_ms: 0,
     track_number: 0,
-    type: "track"
+    type: "track",
+    audio_modes: ""
   };
 
   if (responseStr) {
@@ -1538,6 +1594,9 @@ function parseTrackFromResponse(data, responseStr, trackId) {
     }
     if (schema) {
       result.title = schema.name || "";
+      var schemaTrackID = extractResolvedTrackASIN(String(schema["@id"] || schema.url || ""));
+      result.audio_modes = schemaTrackID && schemaTrackID === normalizeASIN(trackId)
+        ? amazonTrackAudioModes(schema) : "";
       result.explicit = /\[explicit\]/i.test(result.title);
       if (schema.duration) {
         result.duration = parseDurationISO(schema.duration);
@@ -1621,6 +1680,7 @@ function parseTrackFromResponse(data, responseStr, trackId) {
     for (var j = 0; j < allTracks.length; j++) {
       if (allTracks[j].id === trackId) {
         if (allTracks[j].title) result.title = allTracks[j].title;
+        if (allTracks[j].audio_modes) result.audio_modes = allTracks[j].audio_modes;
         if (allTracks[j].artist) result.artist = allTracks[j].artist;
         if (allTracks[j].duration) {
           result.duration = allTracks[j].duration;
@@ -1640,6 +1700,8 @@ function parseTrackFromResponse(data, responseStr, trackId) {
       for (var k = 0; k < allTracks.length; k++) {
         if (allTracks[k].title && allTracks[k].title.toLowerCase() === titleLower) {
           if (allTracks[k].artist) result.artist = allTracks[k].artist;
+          // A title-only fallback cannot identify the exact recording's audio
+          // mode. Never inherit Atmos across album versions with same title.
           if (!result.duration && allTracks[k].duration) {
             result.duration = allTracks[k].duration;
             result.duration_ms = allTracks[k].duration_ms;
@@ -1670,6 +1732,39 @@ function parseTrackFromResponse(data, responseStr, trackId) {
   }));
 
   return result;
+}
+
+// Only an explicitly advertised *track-level* audio mode may establish
+// Amazon Dolby Atmos catalogue availability. AC-4/E-AC-3 codec choices in
+// the addon manifest are provider-wide and cannot certify individual tracks.
+// Never search the whole response: album, playlist or adjacent rows can carry
+// another recording's Atmos badge.
+function amazonTrackAudioModes(track) {
+  if (!track || typeof track !== "object") return "";
+  var scopes = [track, track.metadata, track.attributes, track.audio, track.trackMetadata];
+  for (var s = 0; s < scopes.length; s++) {
+    var value = scopes[s];
+    if (!value || typeof value !== "object") continue;
+    var fields = [
+      value.audioQualities, value.audio_qualities, value.audioModes,
+      value.audio_modes, value.audioMode, value.audio_mode,
+      value.audioTraits, value.audio_traits
+    ];
+    for (var j = 0; j < fields.length; j++) {
+      var candidates = Array.isArray(fields[j]) ? fields[j] : [fields[j]];
+      for (var k = 0; k < candidates.length; k++) {
+        if (typeof candidates[k] !== "string") continue;
+        var values = candidates[k].split(/[,;|]/);
+        for (var m = 0; m < values.length; m++) {
+          var normalized = values[m].trim().toUpperCase().replace(/[ -]/g, "_");
+          if (normalized === "ATMOS" || normalized === "DOLBY_ATMOS") {
+            return "DOLBY_ATMOS";
+          }
+        }
+      }
+    }
+  }
+  return "";
 }
 
 function formatAmazonTrackMetadata(track, album, fallbackTrackNumber) {
@@ -1716,7 +1811,7 @@ function formatAmazonTrackMetadata(track, album, fallbackTrackNumber) {
     item_type: "track",
     album_type: String(track.album_type || album.type || "album"),
     audio_quality: String(track.audio_quality || ""),
-    audio_modes: String(track.audio_modes || "")
+    audio_modes: amazonTrackAudioModes(track)
   };
 }
 
@@ -2844,7 +2939,8 @@ function parseSearchResults(data, filter) {
             comment: amazonAlbumURL(trackAlbumId),
             external_urls: amazonTrackURL(tId),
             provider_id: "amazon",
-            explicit: amazonItemIsExplicit(item)
+            explicit: amazonItemIsExplicit(item),
+            audio_modes: amazonTrackAudioModes(item)
           });
           rememberResourceContext("track", tId, _currentContext);
           if (trackAlbumId) rememberResourceContext("album", trackAlbumId, _currentContext);
@@ -2979,7 +3075,8 @@ function parseSearchResults(data, filter) {
               comment: amazonAlbumURL(tInfo ? tInfo.albumId || "" : ""),
               external_urls: amazonTrackURL(tTrackId),
               provider_id: "amazon",
-              explicit: amazonItemIsExplicit(tItem)
+              explicit: amazonItemIsExplicit(tItem),
+              audio_modes: amazonTrackAudioModes(tItem)
             });
             rememberResourceContext("track", tTrackId, _currentContext);
           }
@@ -3039,28 +3136,50 @@ function availabilityArtistMatches(candidate, expected) {
     expectedKey.indexOf(candidateKey) >= 0;
 }
 
+function stripAvailabilityTitleAnnotations(value) {
+  return String(value || "").replace(/[(\[]\s*(?:(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]+|from\s+["“][^)\]]+["”]\s*)[)\]]/gi, function(annotation) {
+    if (/^[(\[]\s*with\b/i.test(annotation) &&
+        /\b(?:mix|remix|live|acoustic|demo|instrumental|karaoke|edit|extended|slowed|sped)\b/i.test(annotation)) {
+      return annotation;
+    }
+    return " ";
+  }).replace(/\s+/g, " ").trim();
+}
+
 function resolveAmazonTrackBySearch(trackName, artistName, durationMs) {
-  var titleKey = normalizeAvailabilityMatchText(trackName);
+  var strippedTitle = stripAvailabilityTitleAnnotations(trackName);
+  var titleKey = normalizeAvailabilityMatchText(strippedTitle);
   if (!titleKey) return null;
 
-  var results = customSearchSync(trackName, { filter: "songs" });
+  var queries = [String(trackName || "").trim()];
+  // A short or common title alone can return only other artists' songs, so
+  // the title is also searched with the primary artist.
+  var primaryArtist = String(artistName || "")
+    .split(/\s*[,;]\s*|\s+(?:feat\.?|ft\.?|featuring)\s+/i)[0]
+    .trim();
+  var artistQuery = (strippedTitle + " " + primaryArtist).trim();
+  if (queries.indexOf(artistQuery) < 0) queries.push(artistQuery);
+  if (queries.indexOf(strippedTitle) < 0) queries.push(strippedTitle);
   var expectedDuration = Number(durationMs || 0);
-  for (var i = 0; i < results.length; i++) {
-    var candidate = results[i] || {};
-    if (candidate.item_type !== "track") continue;
-    if (normalizeAvailabilityMatchText(candidate.name) !== titleKey) continue;
-    if (!availabilityArtistMatches(candidate.artists, artistName)) continue;
+  for (var queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+    var results = customSearchSync(queries[queryIndex], { filter: "songs" });
+    for (var i = 0; i < results.length; i++) {
+      var candidate = results[i] || {};
+      if (candidate.item_type !== "track") continue;
+      if (normalizeAvailabilityMatchText(stripAvailabilityTitleAnnotations(candidate.name)) !== titleKey) continue;
+      if (!availabilityArtistMatches(candidate.artists, artistName)) continue;
 
-    var candidateDuration = Number(candidate.duration_ms || 0);
-    if (expectedDuration > 0 && candidateDuration > 0 &&
-        Math.abs(expectedDuration - candidateDuration) > 15000) {
-      continue;
-    }
+      var candidateDuration = Number(candidate.duration_ms || 0);
+      if (expectedDuration > 0 && candidateDuration > 0 &&
+          Math.abs(expectedDuration - candidateDuration) > 15000) {
+        continue;
+      }
 
-    var asin = normalizeASIN(String(candidate.id || ""));
-    if (asin) {
-      L("info", "[Amazon] Found exact Amazon track via search:", asin);
-      return asin;
+      var asin = normalizeASIN(String(candidate.id || ""));
+      if (asin) {
+        L("info", "[Amazon] Found exact Amazon track via search:", asin);
+        return asin;
+      }
     }
   }
   L("info", "[Amazon] Amazon search had no exact track match for:", trackName, artistName);
@@ -3744,7 +3863,7 @@ registerExtension({
   initialize: function(config) {
     var settings = config && config.settings ? config.settings : (config || {});
     _homeCountry = String(settings.homeCountry || "US").trim().toUpperCase();
-    L("info", "[Amazon] Extension v2.3.12 init");
+    L("info", "[Amazon] Extension v" + EXTENSION_VERSION + " init");
     initSession();
     return true;
   },
@@ -3828,7 +3947,7 @@ registerExtension({
   },
 
   download: function(trackID, quality, outputPath, onProgress, options) {
-    L("info", "[Amazon] download called:", trackID, quality, "extension: 2.3.12");
+    L("info", "[Amazon] download called:", trackID, quality, "extension: " + EXTENSION_VERSION);
 
     // trackID bisa berupa:
     // - ASIN langsung (dari handleUrl/getAlbum flow, atau checkAvailability)
@@ -3907,7 +4026,8 @@ registerExtension({
         apiResult = fetchWithRetry(requestMedia, true);
       } catch (codecError) {
         if (codec === "flac" || !isAmazonUnavailable(codecError)) throw codecError;
-        L("info", "[Amazon] Codec", codec, "unavailable for ASIN:", asin, "— falling back to FLAC");
+        if (codec === "ac4") throw codecError; // Never substitute stereo for an explicit Atmos request.
+        L("info", "[Amazon] Codec", codec, "unavailable for ASIN:", asin, ": falling back to FLAC");
         codec = "flac";
         operation = {};
         apiResult = fetchWithRetry(requestMedia, true);
